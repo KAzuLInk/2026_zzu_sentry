@@ -49,21 +49,21 @@ void GimbalInit()
         },
         .controller_param_init_config = {
             .angle_PID = {
-                .Kp = 5,          
+                .Kp = 40,
                 .Ki = 0,
-                .Kd = 0.5f,
+                .Kd = 8.2f,
                 .DeadBand = 0.5f,
-                .Derivative_LPF_RC = 0.01f,
+                .Derivative_LPF_RC = 0.0135f,
                 .Output_LPF_RC = 0.02f,
-                .Improve = PID_Integral_Limit | PID_Derivative_On_Measurement,
+                .Improve = PID_Integral_Limit | PID_Derivative_On_Measurement | PID_DerivativeFilter,
                 .IntegralLimit = 100,
                 .MaxOut = 1000,
                 .MaxOut_ = -1000
             },
             .speed_PID = {
-                .Kp = 2,
+                .Kp = 5,
                 .Ki = 0,
-                .Kd = 0,
+                .Kd = 0.012f,
                 .MaxOut = 10000,
                 .MaxOut_ = -10000,
                 .Improve = PID_Integral_Limit,
@@ -137,6 +137,7 @@ void GimbalInit()
     yaw_motor ->t_max = 18.0f;
     yaw_motor->kd_max = 5.0f;
     yaw_motor->kp_max = 5.0f;
+    // yaw_motor->native_mode = DM_NATIVE_MODE_MIT; // 已切回MIT, 注释
     DMMotorSetRef(yaw_motor, 0);  // 初始停住
 
     // ====== 初始化角度环PID(外环) ======
@@ -267,8 +268,8 @@ void GimbalTask()
             yaw_init = 1;
         }
 
-        // 摇杆线性映射: -660→405ecd, 0→中位, +660→2250ecd
-        float stick = rc_data[TEMP].rc.rocker_r_;
+        // 摇杆线性映射: +660→405ecd, 0→中位, -660→2250ecd (ecd增大为正方向)
+        float stick = -rc_data[TEMP].rc.rocker_r_;
         float ratio = (stick + 660.0f) / 1320.0f;
         if (ratio > 1.0f) ratio = 1.0f;
         if (ratio < 0.0f) ratio = 0.0f;

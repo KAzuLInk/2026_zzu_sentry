@@ -167,7 +167,7 @@ static void DMMotorReadReg(DMMotorInstance *motor, uint8_t reg)
  *        使能 → 更新缓存
  *
  * @param motor       DM电机实例
- * @param native_mode 目标模式: DM_NATIVE_MODE_MIT(1)/POSVEL(2)/VEL(3)/POSCUR(4)
+ * @param native_mode 目标模式: DM_NATIVE_MODE_POSVEL(1)/POSVEL(2)/VEL(3)/POSCUR(4)
  *
  * 注意: flash擦写寿命~1万次, cached_native_mode确保只在真正需要时才写入
  */
@@ -413,6 +413,18 @@ void DMMotorTask(void const *argument)
         osDelay(1);
     }
 
+   
+   
+       if (motor->native_mode >= DM_NATIVE_MODE_POSVEL)
+    {
+        for (uint16_t w = 0; w < 500 && motor->motor_daemon->temp_count == 0; w++)
+            osDelay(1);
+        motor->pid_ref = motor->measure.position;
+    }
+   
+   // 原生模式: 等第一帧反馈后, 把pid_ref设成当前真实位置, 避免上电猛转
+
+
     while (1)
     {
         dm_diag_task_loop++;
@@ -452,7 +464,7 @@ void DMMotorTask(void const *argument)
         if (motor->native_mode == DM_NATIVE_MODE_POSVEL)
         {
             float p_cmd = set;
-            float v_cmd = 1.0f;
+            float v_cmd = 2.0f;
             memcpy(&motor->motor_can_instace->tx_buff[0], &p_cmd, 4);
             memcpy(&motor->motor_can_instace->tx_buff[4], &v_cmd, 4);
         }
