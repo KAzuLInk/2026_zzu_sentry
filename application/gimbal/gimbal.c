@@ -288,6 +288,18 @@ void GimbalTask()
 
         small_yaw_debug = total_ref;
         small_yaw_ecd   = ecd;
+
+        // 大小yaw联动: 小yaw超范围时大yaw追踪, 带回差防边界抖动
+        static uint8_t follow = 0;
+        if (ecd > 1850) follow = 1;          // 触发追踪
+        if (ecd < 1550 && follow == 1) follow = 0; // 回差退出
+        if (ecd < 750)  follow = 2;
+        if (ecd > 1050 && follow == 2) follow = 0;
+
+        if (follow == 1 && yaw_angle_ref_locked)
+            yaw_angle_ref += ((float)ecd - 1500.0f) * 0.005f;
+        else if (follow == 2 && yaw_angle_ref_locked)
+            yaw_angle_ref += ((float)ecd - 1000.0f) * 0.005f;
     }
 
     rc_online = RemoteControlIsOnline(); // 看Ozone: 1=在线 0=离线
