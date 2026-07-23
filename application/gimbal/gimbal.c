@@ -333,12 +333,16 @@ void GimbalTask()
 
     if (gimba_IMU_data != NULL)
     {
-        // 首次获取IMU后, 锁定当前绝对角度为目标角度(上电自稳)
         if (!yaw_angle_ref_locked)
         {
             yaw_angle_ref = gimba_IMU_data->YawTotalAngle;
             yaw_angle_ref_locked = 1;
         }
+
+        // 摇杆控制: 左水平摇杆调整yaw目标角度 (度/周期)
+        float stick = -rc_data[TEMP].rc.rocker_l_;
+        if (stick > 30 || stick < -30)
+            yaw_angle_ref += stick / 660.0f * 0.5f;
 
         float current_angle = gimba_IMU_data->YawTotalAngle;
         float target_vel = PIDCalculate(&yaw_angle_pid, current_angle, yaw_angle_ref);
