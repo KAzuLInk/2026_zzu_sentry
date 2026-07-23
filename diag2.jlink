@@ -1,0 +1,17 @@
+device STM32H723VG
+si SWD
+speed 4000
+connect
+r
+g
+sleep 5000
+h
+echo ===== FDCAN1 (0x4000A000) =====
+mem32 0x4000A040 1
+mem32 0x4000A044 1
+mem32 0x4000A074 1
+echo ===== FDCAN2 (0x4000A400) =====
+mem32 0x4000A440 1
+mem32 0x4000A444 1
+mem32 0x4000A474 1
+exit

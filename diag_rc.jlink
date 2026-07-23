@@ -1,0 +1,10 @@
+device STM32H723VG
+si SWD
+speed 4000
+connect
+r
+g
+sleep 3000
+h
+mem32 0x2400a944 1
+exit
