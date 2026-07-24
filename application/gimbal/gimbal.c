@@ -49,21 +49,21 @@ void GimbalInit()
         },
         .controller_param_init_config = {
             .angle_PID = {
-                .Kp = 40,
+                .Kp = 10,
                 .Ki = 0,
-                .Kd = 8.2f,
+                .Kd = 2.0f,
                 .DeadBand = 0.5f,
-                .Derivative_LPF_RC = 0.0135f,
+                .Derivative_LPF_RC = 0.01f,
                 .Output_LPF_RC = 0.02f,
-                .Improve = PID_Integral_Limit | PID_Derivative_On_Measurement | PID_DerivativeFilter,
+                .Improve = PID_Integral_Limit | PID_Derivative_On_Measurement,
                 .IntegralLimit = 100,
                 .MaxOut = 1000,
                 .MaxOut_ = -1000
             },
             .speed_PID = {
-                .Kp = 5,
+                .Kp = 2.8f,
                 .Ki = 0,
-                .Kd = 0.012f,
+                .Kd = 0.002f,
                 .MaxOut = 10000,
                 .MaxOut_ = -10000,
                 .Improve = PID_Integral_Limit,
@@ -252,8 +252,9 @@ volatile float pitch_debug_vel;    // 电机速度 rad/s
 volatile float pitch_debug_gyro;   // (未使用)
 volatile float pitch_debug_out;    // 位置指令 rad
 volatile float pitch_debug_torque; // 电机实际扭矩 Nm (顶限位时飙升)
-volatile float small_yaw_debug;    // 小yaw发送电流值
+volatile float small_yaw_debug;    // 小yaw的total_ref
 volatile uint16_t small_yaw_ecd;   // 小yaw编码器值
+volatile float follow_step;        // 联动step值(正=追右, 负=追左)
 
 void GimbalTask()
 {
@@ -289,17 +290,24 @@ void GimbalTask()
         small_yaw_debug = total_ref;
         small_yaw_ecd   = ecd;
 
-        // 大小yaw联动: 小yaw超范围时大yaw追踪, 带回差防边界抖动
+        // 大小yaw联动: 中心1300, 死区±300(1000~1600), 回差200
         static uint8_t follow = 0;
-        if (ecd > 1850) follow = 1;          // 触发追踪
-        if (ecd < 1550 && follow == 1) follow = 0; // 回差退出
-        if (ecd < 750)  follow = 2;
-        if (ecd > 1050 && follow == 2) follow = 0;
+        if (ecd > 1600) follow = 1;
+        if (ecd < 1400 && follow == 1) follow = 0;
+        if (ecd < 1000)  follow = 2;
+        if (ecd > 1200 && follow == 2) follow = 0;
 
-        if (follow == 1 && yaw_angle_ref_locked)
-            yaw_angle_ref += ((float)ecd - 1500.0f) * 0.005f;
-        else if (follow == 2 && yaw_angle_ref_locked)
-            yaw_angle_ref += ((float)ecd - 1000.0f) * 0.005f;
+        if (yaw_angle_ref_locked && follow)
+        {
+            float dev = (follow == 1) ? ((float)ecd - 1600.0f)
+                                       : ((float)ecd - 1000.0f);
+            float step = dev * dev * dev * 0.00000002f;
+            if (step > 1.0f)  step = 1.0f;
+            if (step < -1.0f) step = -1.0f;
+            follow_step = step;
+            yaw_angle_ref += step;
+        }
+        else follow_step = 0;
     }
 
     rc_online = RemoteControlIsOnline(); // 看Ozone: 1=在线 0=离线
