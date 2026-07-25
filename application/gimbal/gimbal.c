@@ -359,10 +359,7 @@ void GimbalTask()
             yaw_angle_ref_locked = 1;
         }
 
-        // 摇杆控制: 左水平摇杆调整yaw目标角度 (度/周期)
-        float stick = -rc_data[TEMP].rc.rocker_l_;
-        if (stick > 30 || stick < -30)
-            yaw_angle_ref += stick / 660.0f * 0.5f;
+        // 大yaw: 纯IMU锁死, 无摇杆控制 (联动由小yaw触发)
 
         float current_angle = gimba_IMU_data->YawTotalAngle;
         float target_vel = PIDCalculate(&yaw_angle_pid, current_angle, yaw_angle_ref);
