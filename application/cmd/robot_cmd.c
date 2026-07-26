@@ -8,6 +8,9 @@
 #include "message_center.h"
 #include "general_def.h"
 #include "dji_motor.h"
+#include "dmmotor.h"
+extern DMMotorInstance *yaw_motor;
+#define CHAISSIS_FRONT_OFFSET (-1.55f) // 车头方向的yaw_motor->measure.position
 #include "buffer.h"
 #include "referee_task.h"
 
@@ -229,8 +232,23 @@ static void RemoteControlSet()
 
         chassis_cmd_send.wz = 0;
         chassis_cmd_send.chassis_mode = CHASSIS_NO_FOLLOW;
-        chassis_cmd_send.vx = +26 * (float)rc_data[TEMP].rc.rocker_l_; // _水平方向
-        chassis_cmd_send.vy = +26 * (float)rc_data[TEMP].rc.rocker_l1; // 1数值方向
+        // 云台方向 = 前进方向, encoder*ratio → 偏角
+        // 多圈跟踪防套圈
+        static float pos_total = 0, pos_last = 0;
+        static uint8_t pos_init = 0;
+        if (!pos_init) { pos_total = yaw_motor->measure.position; pos_last = pos_total; pos_init = 1; }
+        float delta = yaw_motor->measure.position - pos_last;
+        if (delta > 10.0f)  delta -= 25.0f;  // PMAX-PMIN=25.0
+        if (delta < -10.0f) delta += 25.0f;
+        pos_total += delta;
+        pos_last  = yaw_motor->measure.position;
+
+        float offset_rad = pos_total - CHAISSIS_FRONT_OFFSET;
+        float c = cosf(offset_rad), s = sinf(offset_rad);
+        float vx_raw = +26 * (float)rc_data[TEMP].rc.rocker_l_;
+        float vy_raw = +26 * (float)rc_data[TEMP].rc.rocker_l1;
+        chassis_cmd_send.vx = vx_raw * c - vy_raw * s;
+        chassis_cmd_send.vy = vx_raw * s + vy_raw * c;
     }
 
     //我说实话，自瞄和导航和电控关系不大，你们压力视觉就行，而且注意机械结构有问题直接压力机械组
@@ -267,10 +285,13 @@ static void RemoteControlSet()
             }
         }
 
-        // 导航逻辑代码
-
-        chassis_cmd_send.vy = vision_recv_data->vy * 19500; // 水平方向
-        chassis_cmd_send.vx = vision_recv_data->vx * 19500; // 竖直方向
+        // 导航逻辑代码 — 底盘以云台方向为前进方向
+        float offset_rad2 = yaw_motor->measure.position - CHAISSIS_FRONT_OFFSET;
+        float c2 = cosf(offset_rad2), s2 = sinf(offset_rad2);
+        float vx_nav = vision_recv_data->vx * 19500;
+        float vy_nav = vision_recv_data->vy * 19500;
+        chassis_cmd_send.vx = vx_nav * c2 - vy_nav * s2;
+        chassis_cmd_send.vy = vx_nav * s2 + vy_nav * c2;
         chassis_cmd_send.wz = vision_recv_data->wz;
 
         chassis_cmd_send.wz = vision_recv_data->spin * 10.0f; // 和视觉一致他们要发spin,10是历史残留具体值，具体视觉发多少看chassis.c

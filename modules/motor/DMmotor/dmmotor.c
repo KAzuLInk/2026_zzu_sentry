@@ -406,12 +406,7 @@ void DMMotorTask(void const *argument)
         osDelay(1);
     }
 
-    // 归零 (仅MIT模式需要, 原生模式使用绝对值编码器不需要)
-    if (motor->native_mode == 0)
-    {
-        DMMotorCaliEncoder(motor);
-        osDelay(1);
-    }
+    // 所有模式均不归零, 保留绝对值编码器参照
 
    
    
