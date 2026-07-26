@@ -144,7 +144,7 @@ void GimbalInit()
     // 输入: YawTotalAngle(°)  输出: 目标角速度(°/s)  喂给速度环
     // 调参顺序: 先只给Kp, 手推云台能回弹不抖; 再加Ki克服静摩擦; 最后加Kd
     PID_Init_Config_s yaw_angle_config = {
-        .Kp = 2.0f,                             // 角度误差比例增益
+        .Kp = 27.0f,                            // 角度误差比例增益
         .Ki = 0.03f,                            // 积分增益 — 消除稳态误差, 克服静摩擦
         .Kd = 0.25f,                            // 微分增益 — 抑制超调震荡
         .MaxOut = 60.0f,                        // 输出上限 = 目标角速度 °/s
@@ -161,12 +161,12 @@ void GimbalInit()
     // 输入: Gyro[2](°/s)  输出: 电机速度指令
     // 先把速度环当成一个简单的阻尼环节, 角度环的输出几乎直接传下去
     PID_Init_Config_s yaw_speed_config = {
-        .Kp = 1.0f,                             // 角速度误差比例增益
+        .Kp = 4.7f,                             // 角速度误差比例增益
         .Ki = 0.0f,                             // 积分 — 先关掉
         .Kd = 0.0f,                             // 微分 — 先关掉
         .MaxOut = 15.0f,                         // 输出上限
         .MaxOut_ = -15.0f,
-        .DeadBand = 0.2f,                       // 死区
+        .DeadBand = 0.03f,                      // 死区 (0.2太大, 1°误差的目标速度踩不到)
         .IntegralLimit = 10.0f,                  // 积分限幅
         .Improve = PID_Integral_Limit,
         .Derivative_LPF_RC = 0.0f,
@@ -244,6 +244,8 @@ void GimbalInit()
  *  级联输出 → DMMotorSetRef → MIT velocity_des
  */
 float debugtest; // 诊断用: yaw速度环输出 → DMMotorSetRef
+volatile float yaw_angle_err;  // yaw角度环误差 (°)
+volatile float yaw_speed_err;  // yaw速度环误差 (rad/s)
 volatile uint8_t rc_online;        // 遥控器在线状态
 volatile float pitch_debug_rockr;  // 摇杆
 volatile float pitch_debug_ref;    // 目标角度 rad
@@ -254,7 +256,7 @@ volatile float pitch_debug_out;    // 位置指令 rad
 volatile float pitch_debug_torque; // 电机实际扭矩 Nm (顶限位时飙升)
 volatile float small_yaw_debug;    // 小yaw的total_ref
 volatile uint16_t small_yaw_ecd;   // 小yaw编码器值
-volatile float follow_step;        // 联动step值(正=追右, 负=追左)
+
 
 void GimbalTask()
 {
@@ -289,25 +291,6 @@ void GimbalTask()
 
         small_yaw_debug = total_ref;
         small_yaw_ecd   = ecd;
-
-        // 大小yaw联动: 中心1300, 死区±300(1000~1600), 回差200
-        static uint8_t follow = 0;
-        if (ecd > 1600) follow = 1;
-        if (ecd < 1400 && follow == 1) follow = 0;
-        if (ecd < 1000)  follow = 2;
-        if (ecd > 1200 && follow == 2) follow = 0;
-
-        if (yaw_angle_ref_locked && follow)
-        {
-            float dev = (follow == 1) ? ((float)ecd - 1600.0f)
-                                       : ((float)ecd - 1000.0f);
-            float step = dev * dev * dev * 0.00000002f;
-            if (step > 1.0f)  step = 1.0f;
-            if (step < -1.0f) step = -1.0f;
-            follow_step = step;
-            yaw_angle_ref += step;
-        }
-        else follow_step = 0;
     }
 
     rc_online = RemoteControlIsOnline(); // 看Ozone: 1=在线 0=离线
@@ -359,12 +342,15 @@ void GimbalTask()
             yaw_angle_ref_locked = 1;
         }
 
-        // 大yaw: 纯IMU锁死, 无摇杆控制 (联动由小yaw触发)
+        // 大yaw: 纯IMU锁死, 无摇杆控制
 
         float current_angle = gimba_IMU_data->YawTotalAngle;
+        yaw_angle_err = yaw_angle_ref - current_angle;
         float target_vel = PIDCalculate(&yaw_angle_pid, current_angle, yaw_angle_ref);
+        float target_vel_rad = target_vel * 0.01745f; // °/s → rad/s
         float current_gyro_z = gimba_IMU_data->Gyro[2] * GYRO2GIMBAL_DIR_YAW;
-        float motor_ref = PIDCalculate(&yaw_speed_pid, current_gyro_z, target_vel);
+        yaw_speed_err = target_vel_rad - current_gyro_z;
+        float motor_ref = PIDCalculate(&yaw_speed_pid, current_gyro_z, target_vel_rad);
 
         debugtest = motor_ref;
         DMMotorSetRef(yaw_motor, motor_ref);
