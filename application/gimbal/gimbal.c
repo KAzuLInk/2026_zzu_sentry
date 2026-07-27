@@ -144,9 +144,9 @@ void GimbalInit()
     // 输入: YawTotalAngle(°)  输出: 目标角速度(°/s)  喂给速度环
     // 调参顺序: 先只给Kp, 手推云台能回弹不抖; 再加Ki克服静摩擦; 最后加Kd
     PID_Init_Config_s yaw_angle_config = {
-        .Kp = 27.0f,                            // 角度误差比例增益
+        .Kp = 10.0f,                            // 角度误差比例增益
         .Ki = 0.03f,                            // 积分增益 — 消除稳态误差, 克服静摩擦
-        .Kd = 0.25f,                            // 微分增益 — 抑制超调震荡
+        .Kd = 0.05f,                            // 微分增益 — 抑制超调震荡
         .MaxOut = 60.0f,                        // 输出上限 = 目标角速度 °/s
         .MaxOut_ = -60.0f,
         .DeadBand = 0.05f,                      // 死区 0.05°
@@ -161,7 +161,7 @@ void GimbalInit()
     // 输入: Gyro[2](°/s)  输出: 电机速度指令
     // 先把速度环当成一个简单的阻尼环节, 角度环的输出几乎直接传下去
     PID_Init_Config_s yaw_speed_config = {
-        .Kp = 4.7f,                             // 角速度误差比例增益
+        .Kp = 8.0f,                             // 角速度误差比例增益
         .Ki = 0.0f,                             // 积分 — 先关掉
         .Kd = 0.0f,                             // 微分 — 先关掉
         .MaxOut = 15.0f,                         // 输出上限
@@ -291,6 +291,23 @@ void GimbalTask()
 
         small_yaw_debug = total_ref;
         small_yaw_ecd   = ecd;
+
+        // 大小yaw联动: 小yaw超出1000~1600时大yaw追踪
+        static uint8_t follow = 0;
+        if (ecd > 1600) follow = 1;
+        if (ecd < 1400 && follow == 1) follow = 0;
+        if (ecd < 1000) follow = 2;
+        if (ecd > 1200 && follow == 2) follow = 0;
+
+        if (yaw_angle_ref_locked && follow)
+        {
+            float dev = (follow == 1) ? ((float)ecd - 1600.0f)
+                                       : ((float)ecd - 1000.0f);
+            float step = dev * dev * dev * 0.000000002f;
+            if (step > 0.6f)  step = 0.6f;
+            if (step < -0.6f) step = -0.6f;
+            yaw_angle_ref += step;
+        }
     }
 
     rc_online = RemoteControlIsOnline(); // 看Ozone: 1=在线 0=离线
