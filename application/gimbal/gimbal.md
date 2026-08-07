@@ -1,31 +1,48 @@
 # gimbal
 
-## 当前状态 (2026-07-21)
+## 当前状态 (2026-08-07)
 
-大Yaw: 双环PID，角度环已调好，**速度环未细调**。
-Pitch: 双环PID，参数沿用大Yaw，待调。已加机械限位(上0.60/下-0.05 rad)。
+大Yaw: 双环PID，**单位已修复**（Gyro[2] rad/s 与 target_vel_rad rad/s 统一），待实机按"先内环后外环"重调。
+Pitch: 4310原生POSVEL模式，摇杆直接映射，待调。
 小Yaw: GM6020编码器闭环锁住，PID待调。
+
+### 关键修复 (2026-08-07)
+
+**根因**: 速度环 `target_vel(°/s) - Gyro[2](rad/s)` 混合单位，反馈被低估 57 倍 → 震荡+响应异常。
+
+**修复**: 
+- 速度环统一为 rad/s: `target_vel * DEGREE_2_RAD` 转换后进入速度环
+- 速度环参数重标定: Kp=5.0, Ki=0.5, MaxOut=±12, DeadBand=0.01, Output_LPF_RC=0.01
 
 ### 大Yaw PID参数
 
-| 参数 | 值 | 说明 |
-|---|---|---|
-| Kp | 2.0 | 角度误差比例增益 |
-| Ki | 0.03 | 克服静摩擦，消除稳态误差 |
-| Kd | 0.25 | 抑制超调和震荡 |
-| DeadBand | 0.05° | 死区 |
-| MaxOut | ±60°/s | 输出上限 |
-| IntegralLimit | ±3°/s | 积分限幅 |
+| 环 | 参数 | 值 | 说明 |
+|---|---|---|---|
+| 角度环 | Kp | 2.0 | 角度误差比例增益 (°→°/s) |
+| 角度环 | Ki | 0.03 | 克服静摩擦，消除稳态误差 |
+| 角度环 | Kd | 0.25 | 抑制超调和震荡 |
+| 角度环 | DeadBand | 0.05° | 死区 |
+| 角度环 | MaxOut | ±60°/s | 输出上限 |
+| 角度环 | IntegralLimit | ±3°/s | 积分限幅 |
+| 速度环 | Kp | 5.0 | 速度误差比例增益 (rad/s→rad/s) |
+| 速度环 | Ki | 0.5 | 消除稳态速度误差 |
+| 速度环 | Kd | 0.0 | 微分先关 |
+| 速度环 | DeadBand | 0.01 rad/s | 死区 ≈0.57°/s |
+| 速度环 | MaxOut | ±12 rad/s | 输出上限 |
+| 速度环 | IntegralLimit | ±3 rad/s | 积分限幅 |
+| 速度环 | Output_LPF_RC | 0.01 | 输出低通滤波 |
 
-### 控制结构
+### 数据流 (修复后)
 
 ```
-YawTotalAngle(IMU EKF) → 角度PID → DMMotorSetRef → MIT velocity_des
-                              ↑
-                         yaw_angle_ref (上电锁定)
+YawTotalAngle(°) → [角度PID] → target_vel(°/s) → ×DEGREE_2_RAD → target_vel_rad(rad/s)
+                                                                        ↓
+              Gyro[2](rad/s) ─────────────────────────────────→ [速度PID] → motor_ref(rad/s)
+                                                                        ↓
+                                                                 DMMotorSetRef → MIT velocity_des
 ```
 
-4310的MIT模式自带Kd=2.0速度阻尼，因此不需要额外的速度环。
+### 4310的MIT模式自带Kd=2.0速度阻尼，叠加软件速度环工作。
 
 ### 当前行为
 

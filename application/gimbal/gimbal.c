@@ -158,19 +158,20 @@ void GimbalInit()
     PIDInit(&yaw_angle_pid, &yaw_angle_config);
 
     // ====== 初始化速度环PID(内环) ======
-    // 输入: Gyro[2](°/s)  输出: 电机速度指令
-    // 先把速度环当成一个简单的阻尼环节, 角度环的输出几乎直接传下去
+    // 输入: target_vel_rad(rad/s) 与 Gyro[2](rad/s), 两路统一为 rad/s
+    // 输出: MIT velocity_des (rad/s), 电机内部Kd=2.0叠加工作
+    // 先内环后外环
     PID_Init_Config_s yaw_speed_config = {
-        .Kp = 1.0f,                             // 角速度误差比例增益
-        .Ki = 0.0f,                             // 积分 — 先关掉
+        .Kp = 7.0f,                             // 速度误差比例增益 (rad/s→rad/s) 临界~9,回退20%
+        .Ki = 0.5f,                             // 积分 — 消除稳态速度误差
         .Kd = 0.0f,                             // 微分 — 先关掉
-        .MaxOut = 15.0f,                         // 输出上限
-        .MaxOut_ = -15.0f,
-        .DeadBand = 0.2f,                       // 死区
-        .IntegralLimit = 10.0f,                  // 积分限幅
+        .MaxOut = 12.0f,                        // 输出上限 ±12 rad/s
+        .MaxOut_ = -12.0f,
+        .DeadBand = 0.01f,                      // 死区 0.01 rad/s ≈ 0.57°/s
+        .IntegralLimit = 3.0f,                  // 积分限幅 ±3 rad/s
         .Improve = PID_Integral_Limit,
         .Derivative_LPF_RC = 0.0f,
-        .Output_LPF_RC = 0.0f,
+        .Output_LPF_RC = 0.01f,                 // 输出低通滤波, 抑制毛刺
     };
     PIDInit(&yaw_speed_pid, &yaw_speed_config);
 
@@ -362,9 +363,10 @@ void GimbalTask()
         // 大yaw: 纯IMU锁死, 无摇杆控制 (联动由小yaw触发)
 
         float current_angle = gimba_IMU_data->YawTotalAngle;
-        float target_vel = PIDCalculate(&yaw_angle_pid, current_angle, yaw_angle_ref);
-        float current_gyro_z = gimba_IMU_data->Gyro[2] * GYRO2GIMBAL_DIR_YAW;
-        float motor_ref = PIDCalculate(&yaw_speed_pid, current_gyro_z, target_vel);
+        float target_vel = PIDCalculate(&yaw_angle_pid, current_angle, yaw_angle_ref); // °/s
+        float target_vel_rad = target_vel * DEGREE_2_RAD;  // °/s → rad/s
+        float current_gyro_z = gimba_IMU_data->Gyro[2] * GYRO2GIMBAL_DIR_YAW; // rad/s
+        float motor_ref = PIDCalculate(&yaw_speed_pid, current_gyro_z, target_vel_rad); // 统一 rad/s
 
         debugtest = motor_ref;
         DMMotorSetRef(yaw_motor, motor_ref);

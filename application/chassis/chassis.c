@@ -339,7 +339,7 @@ void ChassisTask()
     {
      case CHASSIS_NO_FOLLOW: // 底盘不旋转,但维持全向机动,一般用于调整云台姿态
 
-        // chassis_cmd_recv.wz = 0;
+        chassis_cmd_recv.wz = 0;
         break;
     case CHASSIS_FOLLOW_GIMBAL_YAW: // 跟随云台,不单独设置pid,以误差角度平方为速度输出
         // chassis_cmd_recv.wz = -1.5 * chassis_cmd_recv.offset_angle * abs(chassis_cmd_recv.offset_angle) - REAL_WZ_RAT*gimbal_fetch_data.gimbal_imu_data.Gyro[2];
@@ -358,7 +358,7 @@ void ChassisTask()
     default:
         break;
     }
-
+    
     // 根据云台和底盘的角度offset将控制量映射到底盘坐标系上
     // 底盘逆时针旋转为角度正方向;云台命令的方向以云台指向的方向为x,采用右手系(x指向正北时y在正东)
     static float sin_theta, cos_theta;
