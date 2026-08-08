@@ -163,7 +163,7 @@ void GimbalInit()
     // 先内环后外环
     PID_Init_Config_s yaw_speed_config = {
         .Kp = 7.0f,                             // 速度误差比例增益 (rad/s→rad/s) 临界~9,回退20%
-        .Ki = 0.5f,                             // 积分 — 消除稳态速度误差
+        .Ki = 0.0f,                             // I=0, 间歇震荡由积分项引起, 静差由外环角度I兜底
         .Kd = 0.0f,                             // 微分 — 先关掉
         .MaxOut = 12.0f,                        // 输出上限 ±12 rad/s
         .MaxOut_ = -12.0f,
@@ -245,6 +245,9 @@ void GimbalInit()
  *  级联输出 → DMMotorSetRef → MIT velocity_des
  */
 float debugtest; // 诊断用: yaw速度环输出 → DMMotorSetRef
+float gyro_lpf_val;          // 陀螺仪滤波后的值 (rad/s)
+float gyro_lpf_rc = 0.1f;    // LPF的RC常数, Ozone可改: 越大滤波越强
+uint32_t gyro_lpf_dwt;       // LPF时间戳
 volatile uint8_t rc_online;        // 遥控器在线状态
 volatile float pitch_debug_rockr;  // 摇杆
 volatile float pitch_debug_ref;    // 目标角度 rad
@@ -366,7 +369,12 @@ void GimbalTask()
         float target_vel = PIDCalculate(&yaw_angle_pid, current_angle, yaw_angle_ref); // °/s
         float target_vel_rad = target_vel * DEGREE_2_RAD;  // °/s → rad/s
         float current_gyro_z = gimba_IMU_data->Gyro[2] * GYRO2GIMBAL_DIR_YAW; // rad/s
-        float motor_ref = PIDCalculate(&yaw_speed_pid, current_gyro_z, target_vel_rad); // 统一 rad/s
+        // 陀螺仪输入低通滤波 — 切断机械振动→速度环的正反馈路径
+        float dt_lpf = DWT_GetDeltaT(&gyro_lpf_dwt);
+        if (dt_lpf > 0.01f) dt_lpf = 0.001f; // 首次调用防阶跃
+        gyro_lpf_val = current_gyro_z * dt_lpf / (gyro_lpf_rc + dt_lpf)
+                     + gyro_lpf_val * gyro_lpf_rc / (gyro_lpf_rc + dt_lpf);
+        float motor_ref = PIDCalculate(&yaw_speed_pid, gyro_lpf_val, target_vel_rad); // 统一 rad/s
 
         debugtest = motor_ref;
         DMMotorSetRef(yaw_motor, motor_ref);
