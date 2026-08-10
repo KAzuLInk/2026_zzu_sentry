@@ -144,15 +144,15 @@ void GimbalInit()
     // 输入: YawTotalAngle(°)  输出: 目标角速度(°/s)  喂给速度环
     // 调参顺序: 先只给Kp, 手推云台能回弹不抖; 再加Ki克服静摩擦; 最后加Kd
     PID_Init_Config_s yaw_angle_config = {
-        .Kp = 2.0f,                             // 角度误差比例增益
+        .Kp = 3.0f,                             // 角度误差比例增益
         .Ki = 0.03f,                            // 积分增益 — 消除稳态误差, 克服静摩擦
-        .Kd = 0.25f,                            // 微分增益 — 抑制超调震荡
+        .Kd = 0.2f,                            // 微分增益 — 抑制超调震荡
         .MaxOut = 60.0f,                        // 输出上限 = 目标角速度 °/s
         .MaxOut_ = -60.0f,
         .DeadBand = 0.05f,                      // 死区 0.05°
         .IntegralLimit = 3.0f,                   // 积分限幅 — I最多贡献±3°/s
-        .Improve = PID_Integral_Limit,
-        .Derivative_LPF_RC = 0.0f,
+        .Improve = PID_Integral_Limit | PID_Derivative_On_Measurement,
+        .Derivative_LPF_RC = 0.02f,             // 微分低通滤波, 抑制IMU噪声放大
         .Output_LPF_RC = 0.0f,
     };
     PIDInit(&yaw_angle_pid, &yaw_angle_config);
@@ -162,7 +162,7 @@ void GimbalInit()
     // 输出: MIT velocity_des (rad/s), 电机内部Kd=2.0叠加工作
     // 先内环后外环
     PID_Init_Config_s yaw_speed_config = {
-        .Kp = 7.0f,                             // 速度误差比例增益 (rad/s→rad/s) 临界~9,回退20%
+        .Kp = 8.0f,                             // 速度误差比例增益 (rad/s→rad/s) 临界~9,回退20%
         .Ki = 0.0f,                             // I=0, 间歇震荡由积分项引起, 静差由外环角度I兜底
         .Kd = 0.0f,                             // 微分 — 先关掉
         .MaxOut = 12.0f,                        // 输出上限 ±12 rad/s
@@ -246,7 +246,7 @@ void GimbalInit()
  */
 float debugtest; // 诊断用: yaw速度环输出 → DMMotorSetRef
 float gyro_lpf_val;          // 陀螺仪滤波后的值 (rad/s)
-float gyro_lpf_rc = 0.1f;    // LPF的RC常数, Ozone可改: 越大滤波越强
+float gyro_lpf_rc = 0.3f;    // LPF的RC常数, Ozone可改: 越大滤波越强
 uint32_t gyro_lpf_dwt;       // LPF时间戳
 volatile uint8_t rc_online;        // 遥控器在线状态
 volatile float pitch_debug_rockr;  // 摇杆
