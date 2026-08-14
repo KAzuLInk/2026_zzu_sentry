@@ -31,7 +31,9 @@
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
-
+typedef void (*USBCallback)(uint16_t len);  // USB收发回调类型
+static USBCallback usb_tx_callback = NULL;  //指针指向发送数据
+static USBCallback usb_rx_callback = NULL;  //指针指向接收数据
 /* USER CODE END PV */
 
 /** @addtogroup STM32_USB_OTG_DEVICE_LIBRARY
@@ -108,9 +110,14 @@ uint8_t UserTxBufferHS[APP_TX_DATA_SIZE];
   */
 
 extern USBD_HandleTypeDef hUsbDeviceHS;
-
+uint8_t *CDCInitRxbufferNcallback(USBCallback tx_cbk, USBCallback rx_cbk)
 /* USER CODE BEGIN EXPORTED_VARIABLES */
-
+{
+  //注册中断回调类型，指针指向发送、接收数据包
+    usb_tx_callback = tx_cbk;
+    usb_rx_callback = rx_cbk;
+    return UserRxBufferHS;  // 返回接收缓冲区指针
+}
 /* USER CODE END EXPORTED_VARIABLES */
 
 /**
@@ -264,8 +271,13 @@ static int8_t CDC_Control_HS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_HS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 11 */
+  //将收到len字节数据拷进缓冲区
   USBD_CDC_SetRxBuffer(&hUsbDeviceHS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceHS);
+  // 收到数据 → 指针指向数据
+  if (usb_rx_callback != NULL) {
+    usb_rx_callback(*Len);  
+  }
   return (USBD_OK);
   /* USER CODE END 11 */
 }
@@ -307,6 +319,9 @@ static int8_t CDC_TransmitCplt_HS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
 {
   uint8_t result = USBD_OK;
   /* USER CODE BEGIN 14 */
+  if (usb_tx_callback != NULL) {
+    usb_tx_callback(0);  // 发送完成 → 调用用户回调
+  }
   UNUSED(Buf);
   UNUSED(Len);
   UNUSED(epnum);

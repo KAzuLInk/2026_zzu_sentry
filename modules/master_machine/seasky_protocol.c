@@ -15,6 +15,8 @@
 #include "crc16.h"
 #include "memory.h"
 
+/* ==================== 旧协议实现（保留，供旧 UART 视觉链路使用） ==================== */
+
 /*获取CRC8校验码*/
 uint8_t Get_CRC8_Check(uint8_t *pchMessage, uint16_t dwLength)
 {
@@ -118,11 +120,11 @@ uint16_t get_protocol_info(uint8_t *rx_buf,          // 接收到的原始数据
     // 放在静态区,避免反复申请栈上空间
     static protocol_rm_struct pro;
     static uint16_t date_length;
-    
+
     if (protocol_heade_Check(&pro, rx_buf))
     {
         static uint32_t fag;
-        fag++;  
+        fag++;
         date_length = OFFSET_BYTE + pro.header.data_length;
         // if (CRC16_Check_Sum(&rx_buf[0], date_length))
         {
@@ -133,4 +135,68 @@ uint16_t get_protocol_info(uint8_t *rx_buf,          // 接收到的原始数据
         }
     }
     return 0;
+}
+
+/* ==================== V1 协议实现（USB 虚拟串口，见 USB协议与类使用说明_V1.md） ==================== */
+
+uint16_t seasky_send(uint8_t msg_id, const uint8_t *payload, uint16_t payload_len,
+                     uint8_t *tx_buf)
+{
+    uint16_t crc;
+
+    tx_buf[0] = PROTOCOL_CMD_ID;           /* 帧头 */
+    tx_buf[1] = payload_len & 0xff;        /* Len 低字节 */
+    tx_buf[2] = (payload_len >> 8) & 0xff; /* Len 高字节 */
+    tx_buf[3] = msg_id;                    /* Msg_ID（1 字节） */
+    if (payload_len > 0 && payload != NULL)
+        memcpy(&tx_buf[4], payload, payload_len);
+
+    /* CRC-16/Modbus 覆盖前 4+Len 字节，小端写入 */
+    crc = crc_modbus(tx_buf, 4 + payload_len);
+    tx_buf[4 + payload_len]     = crc & 0xff;
+    tx_buf[4 + payload_len + 1] = (crc >> 8) & 0xff;
+
+    return 6 + payload_len; /* 帧总长 */
+}
+
+int16_t seasky_recv(uint8_t msg_id, const uint8_t *rx_buf, uint16_t rx_len,
+                    uint8_t *payload, uint16_t *payload_len)
+{
+    uint16_t i = 0;
+    uint16_t len;
+    uint16_t crc_calc, crc_recv;
+
+    while (i + 6 <= rx_len) /* 最小帧为 6 字节 */
+    {
+        if (rx_buf[i] != PROTOCOL_CMD_ID) /* 找帧头 */
+        {
+            i++;
+            continue;
+        }
+
+        len = rx_buf[i + 1] | ((uint16_t)rx_buf[i + 2] << 8);
+
+        if (i + 6 + len > rx_len) /* 半帧：等下次补数 */
+            return -1;
+
+        crc_calc = crc_modbus(&rx_buf[i], 4 + len);
+        crc_recv = rx_buf[i + 4 + len] | ((uint16_t)rx_buf[i + 4 + len + 1] << 8);
+        if (crc_calc != crc_recv) /* 假帧头，跳过继续搜 */
+        {
+            i++;
+            continue;
+        }
+
+        if (rx_buf[i + 3] == msg_id) /* 匹配：提取 payload */
+        {
+            if (payload != NULL && len > 0)
+                memcpy(payload, &rx_buf[i + 4], len);
+            if (payload_len != NULL)
+                *payload_len = len;
+            return (int16_t)len;
+        }
+
+        i += 6 + len; /* 合法帧但 id 不匹配：整帧跳过 */
+    }
+    return -1;
 }

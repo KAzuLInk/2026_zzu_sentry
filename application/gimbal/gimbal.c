@@ -162,13 +162,13 @@ void GimbalInit()
     // 输出: MIT velocity_des (rad/s), 电机内部Kd=2.0叠加工作
     // 先内环后外环
     PID_Init_Config_s yaw_speed_config = {
-        .Kp = 8.0f,                             // 速度误差比例增益 (rad/s→rad/s) 临界~9,回退20%
-        .Ki = 0.0f,                             // I=0, 间歇震荡由积分项引起, 静差由外环角度I兜底
+        .Kp = 1.0f,                             // 速度误差比例增益 (rad/s→rad/s), 前馈兜底后P只做阻尼
+        .Ki = 0.0f,                             // I=0, 前馈已保证稳态速度, 无需积分
         .Kd = 0.0f,                             // 微分 — 先关掉
-        .MaxOut = 12.0f,                        // 输出上限 ±12 rad/s
-        .MaxOut_ = -12.0f,
+        .MaxOut = 2.0f,                        // 输出上限 = 修正项 ±2 rad/s(前馈目标在外部叠加)
+        .MaxOut_ = -2.0f,
         .DeadBand = 0.0f,                      // 死区 0.01 rad/s ≈ 0.57°/s
-        .IntegralLimit = 3.0f,                  // 积分限幅 ±3 rad/s
+        .IntegralLimit = 1.0f,                  // 积分限幅 ±1 rad/s
         .Improve = PID_Integral_Limit,
         .Derivative_LPF_RC = 0.0f,
         .Output_LPF_RC = 0.01f,                 // 输出低通滤波, 抑制毛刺
@@ -246,7 +246,7 @@ void GimbalInit()
  */
 float debugtest; // 诊断用: yaw速度环输出 → DMMotorSetRef
 float gyro_lpf_val;          // 陀螺仪滤波后的值 (rad/s)
-float gyro_lpf_rc = 0.3f;    // LPF的RC常数, Ozone可改: 越大滤波越强
+float gyro_lpf_rc = 0.03f;    // LPF的RC常数, Ozone可改: 越大滤波越强
 uint32_t gyro_lpf_dwt;       // LPF时间戳
 volatile uint8_t rc_online;        // 遥控器在线状态
 volatile float pitch_debug_rockr;  // 摇杆
@@ -258,7 +258,7 @@ volatile float pitch_debug_out;    // 位置指令 rad
 volatile float pitch_debug_torque; // 电机实际扭矩 Nm (顶限位时飙升)
 volatile float small_yaw_debug;    // 小yaw的total_ref
 volatile uint16_t small_yaw_ecd;   // 小yaw编码器值
-volatile float yaw_speed_ref_deg = 120.0f;  // 速控满偏角速度 °/s, Ozone可调
+volatile float yaw_speed_ref_deg = 150.0f;  // 速控满偏角速度 °/s, Ozone可调
 static uint16_t small_yaw_home_ecd = 0;     // 小yaw上电锁定位(速控模式用)
 static uint8_t  small_yaw_ctl_init = 0;     // 小yaw闭环初始化标志
 static uint8_t  last_speed_control = 0;     // 上一拍是否速控(用于切回时重锁定)
@@ -342,7 +342,7 @@ void GimbalTask()
             if (dt_lpf > 0.01f) dt_lpf = 0.001f; // 首次调用防阶跃
             gyro_lpf_val = current_gyro_z * dt_lpf / (gyro_lpf_rc + dt_lpf)
                          + gyro_lpf_val * gyro_lpf_rc / (gyro_lpf_rc + dt_lpf);
-            float motor_ref = PIDCalculate(&yaw_speed_pid, gyro_lpf_val, target_vel_rad);
+            float motor_ref = target_vel_rad + PIDCalculate(&yaw_speed_pid, gyro_lpf_val, target_vel_rad);
 
             debugtest = motor_ref;
             DMMotorSetRef(yaw_motor, motor_ref);
@@ -414,7 +414,7 @@ void GimbalTask()
             if (dt_lpf > 0.01f) dt_lpf = 0.001f; // 首次调用防阶跃
             gyro_lpf_val = current_gyro_z * dt_lpf / (gyro_lpf_rc + dt_lpf)
                          + gyro_lpf_val * gyro_lpf_rc / (gyro_lpf_rc + dt_lpf);
-            float motor_ref = PIDCalculate(&yaw_speed_pid, gyro_lpf_val, target_vel_rad); // 统一 rad/s
+            float motor_ref = target_vel_rad + PIDCalculate(&yaw_speed_pid, gyro_lpf_val, target_vel_rad); // 统一 rad/s
 
             debugtest = motor_ref;
             DMMotorSetRef(yaw_motor, motor_ref);

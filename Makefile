@@ -111,6 +111,7 @@ bsp/can/bsp_can.c \
 bsp/usart/bsp_usart.c \
 bsp/log/bsp_log.c \
 bsp/bsp_tools.c \
+bsp/usb/bsp_usb.c \
 modules/algorithm/controller.c \
 modules/algorithm/kalman_filter.c \
 modules/algorithm/QuaternionEKF.c \
@@ -241,6 +242,7 @@ C_INCLUDES =  \
 -Ibsp/log \
 -Ibsp/pwm \
 -Ibsp \
+-Ibsp/usb \
 -Imodules/algorithm \
 -Imodules/bluetooth \
 -Imodules/BMI088 \
@@ -348,6 +350,6 @@ clean:
 download_dap:
 	openocd -f openocd_dap.cfg -c init -c halt -c "flash write_image erase $(BUILD_DIR)/$(TARGET).bin 0x08000000" -c reset -c shutdown
 download_jlink:
-	"$(JFLASH)" -openprj'stm32.jflash' -open'$(BUILD_DIR)/$(TARGET).hex',0x8000000 -auto -startapp -exit
+	JFlash -openprj'stm32.jflash' -open'$(BUILD_DIR)/$(TARGET).hex',0x8000000 -auto -startapp -exit
 
 # *** EOF ***
