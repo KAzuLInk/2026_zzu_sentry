@@ -49,23 +49,23 @@ void GimbalInit()
         },
         .controller_param_init_config = {
             .angle_PID = {
-                .Kp = 10,
+                .Kp = 25,
                 .Ki = 0,
-                .Kd = 2.0f,
-                .DeadBand = 0.5f,
+                .Kd = 0.0f,
+                .DeadBand = 0.1f,
                 .Derivative_LPF_RC = 0.01f,
                 .Output_LPF_RC = 0.02f,
                 .Improve = PID_Integral_Limit | PID_Derivative_On_Measurement,
                 .IntegralLimit = 100,
-                .MaxOut = 1000,
-                .MaxOut_ = -1000
+                .MaxOut = 2000,
+                .MaxOut_ = -2000
             },
             .speed_PID = {
-                .Kp = 2.8f,
-                .Ki = 0,
-                .Kd = 0.002f,
-                .MaxOut = 10000,
-                .MaxOut_ = -10000,
+                .Kp = 55.0f,
+                .Ki = 10.0f,
+                .Kd = 0.0f,
+                .MaxOut = 30000,
+                .MaxOut_ = -30000,
                 .Improve = PID_Integral_Limit,
                 .IntegralLimit = 3000,
             },
@@ -147,9 +147,9 @@ void GimbalInit()
         .Kp = 3.0f,                             // 角度误差比例增益
         .Ki = 0.03f,                            // 积分增益 — 消除稳态误差, 克服静摩擦
         .Kd = 0.2f,                            // 微分增益 — 抑制超调震荡
-        .MaxOut = 60.0f,                        // 输出上限 = 目标角速度 °/s
-        .MaxOut_ = -60.0f,
-        .DeadBand = 0.05f,                      // 死区 0.05°
+        .MaxOut = 150.0f,                       // 输出上限 = 目标角速度 °/s (回中模式需150, 原60)
+        .MaxOut_ = -150.0f,
+        .DeadBand = 0.0f,                      // 死区 0.05°
         .IntegralLimit = 3.0f,                   // 积分限幅 — I最多贡献±3°/s
         .Improve = PID_Integral_Limit | PID_Derivative_On_Measurement,
         .Derivative_LPF_RC = 0.02f,             // 微分低通滤波, 抑制IMU噪声放大
@@ -167,7 +167,7 @@ void GimbalInit()
         .Kd = 0.0f,                             // 微分 — 先关掉
         .MaxOut = 12.0f,                        // 输出上限 ±12 rad/s
         .MaxOut_ = -12.0f,
-        .DeadBand = 0.01f,                      // 死区 0.01 rad/s ≈ 0.57°/s
+        .DeadBand = 0.0f,                      // 死区 0.01 rad/s ≈ 0.57°/s
         .IntegralLimit = 3.0f,                  // 积分限幅 ±3 rad/s
         .Improve = PID_Integral_Limit,
         .Derivative_LPF_RC = 0.0f,
@@ -258,60 +258,167 @@ volatile float pitch_debug_out;    // 位置指令 rad
 volatile float pitch_debug_torque; // 电机实际扭矩 Nm (顶限位时飙升)
 volatile float small_yaw_debug;    // 小yaw的total_ref
 volatile uint16_t small_yaw_ecd;   // 小yaw编码器值
-volatile float follow_step;        // 联动step值(正=追右, 负=追左)
+volatile float yaw_speed_ref_deg = 120.0f;  // 速控满偏角速度 °/s, Ozone可调
+static uint16_t small_yaw_home_ecd = 0;     // 小yaw上电锁定位(速控模式用)
+static uint8_t  small_yaw_ctl_init = 0;     // 小yaw闭环初始化标志
+static uint8_t  last_speed_control = 0;     // 上一拍是否速控(用于切回时重锁定)
+
+// 小yaw主控 — 大yaw回中曲线 (Ozone可调)
+volatile float recenter_max_vel  = 150.0f;  // 边缘处大yaw回中角速度上限 °/s (= 60×2.5)
+volatile float recenter_deadband = 300.0f;  // 中心死区(ecd计数, ±300 → 1000~1600不动)
+volatile float recenter_sat      = 800.0f;  // 速度饱和偏移量(ecd, 离中心800 → 2100/500, 留余量防小yaw超调)
+volatile float recenter_exp      = 3.0f;    // 曲线指数: 2=平方, 3=三次方
+volatile float recenter_debug    = 0.0f;    // 诊断: 当前回中角速度 °/s
+static uint32_t recenter_dwt     = 0;       // 回中积分时间戳
 
 void GimbalTask()
 {
-    // 小Yaw: 位置模式 — 摇杆→ecd→total_angle, 绝对值映射不累积
-    if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0)
+    uint8_t sw_right    = rc_data[TEMP].rc.switch_right;
+    uint8_t sw_left     = rc_data[TEMP].rc.switch_left;
+    uint8_t remote_mode = switch_is_down(sw_right); // 右下 = 遥控器模式
+
+    // 小yaw初始化(上电一次): 闭环类型 + 锁定初始位
+    if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0 && !small_yaw_ctl_init)
     {
-        static uint8_t yaw_init = 0;
-        if (!yaw_init)
+        small_yaw_motor->motor_settings.close_loop_type = ANGLE_LOOP | SPEED_LOOP;
+        small_yaw_motor->motor_settings.outer_loop_type = ANGLE_LOOP;
+        small_yaw_home_ecd = small_yaw_motor->measure.ecd; // 上电初始位
+        small_yaw_ctl_init = 1;
+    }
+
+    // 子模式: 右下 + 左上 = 失能 → 停所有电机
+    if (remote_mode && switch_is_up(sw_left))
+    {
+        // 大yaw(MIT): vel_des=0 配合 Kd=2.0 主动阻尼刹车
+        //   (DMMotorStop发全0帧, Kd=0被固件拒收→电机疯转, 不能用)
+        DMMotorSetRef(yaw_motor, 0);
+        // Pitch(POSVEL): 失能回到安全位 0.2 rad (在行程范围 0~0.48 内)
+        DMMotorSetRef(pitch_motor, 0.2f);
+        // 小yaw(GM6020): 0电流失能
+        if (small_yaw_motor != NULL) DJIMotorStop(small_yaw_motor);
+        yaw_angle_ref_locked = 0; // 重新使能后重锁定当前角, 防猛转回旧ref
+        rc_online = RemoteControlIsOnline();
+        return;
+    }
+
+    // 非失能: 小yaw恢复使能 (失能分支用DJIMotorStop置停)
+    if (small_yaw_motor != NULL) DJIMotorEnable(small_yaw_motor);
+
+    // 子模式: 右下 + 左中 = 速控 (大yaw摇杆速控 + 小yaw锁死)
+    uint8_t speed_control = remote_mode && switch_is_mid(sw_left);
+
+    // 刚从速控切回跟随: 重锁定当前角, 防大yaw猛转回旧ref
+    if (!speed_control && last_speed_control)
+        yaw_angle_ref_locked = 0;
+    last_speed_control = speed_control;
+
+    // 懒加载IMU数据指针
+    if (gimba_IMU_data == NULL)
+        gimba_IMU_data = INS_Init();
+
+    if (speed_control)
+    {
+        // ====== 速控模式 ======
+        // 小yaw: 锁死在上电初始位
+        if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0)
         {
-            small_yaw_motor->motor_settings.close_loop_type = ANGLE_LOOP | SPEED_LOOP;
-            small_yaw_motor->motor_settings.outer_loop_type = ANGLE_LOOP;
-            yaw_init = 1;
+            float total_ref = small_yaw_motor->measure.total_angle
+                            + ((float)small_yaw_home_ecd - (float)small_yaw_motor->measure.ecd) * ECD_ANGLE_COEF_DJI;
+            DJIMotorSetRef(small_yaw_motor, total_ref);
+            small_yaw_debug = total_ref;
+            small_yaw_ecd   = small_yaw_motor->measure.ecd;
         }
 
-        // 摇杆线性映射: +660→405ecd, 0→中位, -660→2250ecd (ecd增大为正方向)
-        float stick = -rc_data[TEMP].rc.rocker_r_;
-        float ratio = (stick + 660.0f) / 1320.0f;
-        if (ratio > 1.0f) ratio = 1.0f;
-        if (ratio < 0.0f) ratio = 0.0f;
-        float ecd_target = 405.0f + ratio * (2250.0f - 405.0f);
-
-        // 限位
-        uint16_t ecd = small_yaw_motor->measure.ecd;
-        if (ecd > 2250 && ecd_target > ecd) ecd_target = ecd;
-        if (ecd < 405  && ecd_target < ecd) ecd_target = ecd;
-        if (ecd_target > 2250) ecd_target = 2250;
-        if (ecd_target < 405)  ecd_target = 405;
-
-        // 绝对值: total_angle = 当前total + (目标ecd - 当前ecd)
-        float total_ref = small_yaw_motor->measure.total_angle + (ecd_target - (float)ecd);
-        DJIMotorSetRef(small_yaw_motor, total_ref);
-
-        small_yaw_debug = total_ref;
-        small_yaw_ecd   = ecd;
-
-        // 大小yaw联动: 中心1300, 死区±300(1000~1600), 回差200
-        static uint8_t follow = 0;
-        if (ecd > 1600) follow = 1;
-        if (ecd < 1400 && follow == 1) follow = 0;
-        if (ecd < 1000)  follow = 2;
-        if (ecd > 1200 && follow == 2) follow = 0;
-
-        if (yaw_angle_ref_locked && follow)
+        // 大yaw: 摇杆速控(跳过角度环), 满偏 = yaw_speed_ref_deg
+        if (gimba_IMU_data != NULL)
         {
-            float dev = (follow == 1) ? ((float)ecd - 1600.0f)
-                                       : ((float)ecd - 1000.0f);
-            float step = dev * dev * dev * 0.00000002f;
-            if (step > 1.0f)  step = 1.0f;
-            if (step < -1.0f) step = -1.0f;
-            follow_step = step;
-            yaw_angle_ref += step;
+            float stick = rc_data[TEMP].rc.rocker_r_;           // -660 ~ +660
+            if (stick > -20.0f && stick < 20.0f) stick = 0.0f;  // 中心死区, 防漂移
+            float target_vel_deg = stick / 660.0f * yaw_speed_ref_deg;
+            float target_vel_rad = target_vel_deg * DEGREE_2_RAD; // °/s → rad/s
+
+            float current_gyro_z = gimba_IMU_data->Gyro[2] * GYRO2GIMBAL_DIR_YAW; // rad/s
+            float dt_lpf = DWT_GetDeltaT(&gyro_lpf_dwt);
+            if (dt_lpf > 0.01f) dt_lpf = 0.001f; // 首次调用防阶跃
+            gyro_lpf_val = current_gyro_z * dt_lpf / (gyro_lpf_rc + dt_lpf)
+                         + gyro_lpf_val * gyro_lpf_rc / (gyro_lpf_rc + dt_lpf);
+            float motor_ref = PIDCalculate(&yaw_speed_pid, gyro_lpf_val, target_vel_rad);
+
+            debugtest = motor_ref;
+            DMMotorSetRef(yaw_motor, motor_ref);
         }
-        else follow_step = 0;
+    }
+    else
+    {
+        // ====== 跟随模式(现有逻辑) ======
+        // 小Yaw: 位置模式 — 摇杆→ecd→total_angle, 绝对值映射不累积
+        if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0)
+        {
+            // 摇杆线性映射: +660→405ecd, 0→中位, -660→2250ecd (ecd增大为正方向)
+            float stick = -rc_data[TEMP].rc.rocker_r_;
+            float ratio = (stick + 660.0f) / 1320.0f;
+            if (ratio > 1.0f) ratio = 1.0f;
+            if (ratio < 0.0f) ratio = 0.0f;
+            float ecd_target = 405.0f + ratio * (2250.0f - 405.0f);
+
+            // 限位
+            uint16_t ecd = small_yaw_motor->measure.ecd;
+            if (ecd > 2250 && ecd_target > ecd) ecd_target = ecd;
+            if (ecd < 405  && ecd_target < ecd) ecd_target = ecd;
+            if (ecd_target > 2250) ecd_target = 2250;
+            if (ecd_target < 405)  ecd_target = 405;
+
+            // 绝对值(度): total_angle = 当前total + (目标ecd - 当前ecd) * 每格度数
+            float total_ref = small_yaw_motor->measure.total_angle + (ecd_target - (float)ecd) * ECD_ANGLE_COEF_DJI;
+            DJIMotorSetRef(small_yaw_motor, total_ref);
+
+            small_yaw_debug = total_ref;
+            small_yaw_ecd   = ecd;
+        }
+
+        // 大yaw: IMU自稳(锁绝对角) + 小yaw回中(偏离中心越大角度偏移越大)
+        if (gimba_IMU_data != NULL)
+        {
+            if (!yaw_angle_ref_locked)
+            {
+                yaw_angle_ref = gimba_IMU_data->YawTotalAngle;
+                yaw_angle_ref_locked = 1;
+            }
+
+            // 回中曲线: 小yaw偏离中心(1300)越多, 回中角速度越大(三次方/平方), 积分进角度ref
+            float recenter_vel = 0.0f;
+            if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0)
+            {
+                float off = (float)small_yaw_motor->measure.ecd - 1300.0f; // 有符号: 右正左负
+                float mag = off < 0.0f ? -off : off;
+                if (mag > recenter_deadband)
+                {
+                    float x = (mag - recenter_deadband) / (recenter_sat - recenter_deadband);
+                    if (x > 1.0f) x = 1.0f;
+                    float sign = off > 0.0f ? 1.0f : -1.0f;
+                    recenter_vel = sign * recenter_max_vel * powf(x, recenter_exp); // °/s
+                }
+            }
+            recenter_debug = recenter_vel;
+
+            float dt = DWT_GetDeltaT(&recenter_dwt);
+            if (dt > 0.02f) dt = 0.01f; // 首次调用/机械延迟防护, 100Hz下约10ms
+            yaw_angle_ref += recenter_vel * dt; // 积分进角度ref
+
+            float current_angle = gimba_IMU_data->YawTotalAngle;
+            float target_vel = PIDCalculate(&yaw_angle_pid, current_angle, yaw_angle_ref); // °/s
+            float target_vel_rad = target_vel * DEGREE_2_RAD;  // °/s → rad/s
+            float current_gyro_z = gimba_IMU_data->Gyro[2] * GYRO2GIMBAL_DIR_YAW; // rad/s
+            // 陀螺仪输入低通滤波 — 切断机械振动→速度环的正反馈路径
+            float dt_lpf = DWT_GetDeltaT(&gyro_lpf_dwt);
+            if (dt_lpf > 0.01f) dt_lpf = 0.001f; // 首次调用防阶跃
+            gyro_lpf_val = current_gyro_z * dt_lpf / (gyro_lpf_rc + dt_lpf)
+                         + gyro_lpf_val * gyro_lpf_rc / (gyro_lpf_rc + dt_lpf);
+            float motor_ref = PIDCalculate(&yaw_speed_pid, gyro_lpf_val, target_vel_rad); // 统一 rad/s
+
+            debugtest = motor_ref;
+            DMMotorSetRef(yaw_motor, motor_ref);
+        }
     }
 
     rc_online = RemoteControlIsOnline(); // 看Ozone: 1=在线 0=离线
@@ -349,35 +456,6 @@ void GimbalTask()
         DMMotorSetRef(pitch_motor, pos_ref);
         pitch_debug_torque = pitch_motor->measure.torque; // 顶限位时飙升
         pitch_done:;
-    }
-
-    // 懒加载IMU数据指针
-    if (gimba_IMU_data == NULL)
-        gimba_IMU_data = INS_Init();
-
-    if (gimba_IMU_data != NULL)
-    {
-        if (!yaw_angle_ref_locked)
-        {
-            yaw_angle_ref = gimba_IMU_data->YawTotalAngle;
-            yaw_angle_ref_locked = 1;
-        }
-
-        // 大yaw: 纯IMU锁死, 无摇杆控制 (联动由小yaw触发)
-
-        float current_angle = gimba_IMU_data->YawTotalAngle;
-        float target_vel = PIDCalculate(&yaw_angle_pid, current_angle, yaw_angle_ref); // °/s
-        float target_vel_rad = target_vel * DEGREE_2_RAD;  // °/s → rad/s
-        float current_gyro_z = gimba_IMU_data->Gyro[2] * GYRO2GIMBAL_DIR_YAW; // rad/s
-        // 陀螺仪输入低通滤波 — 切断机械振动→速度环的正反馈路径
-        float dt_lpf = DWT_GetDeltaT(&gyro_lpf_dwt);
-        if (dt_lpf > 0.01f) dt_lpf = 0.001f; // 首次调用防阶跃
-        gyro_lpf_val = current_gyro_z * dt_lpf / (gyro_lpf_rc + dt_lpf)
-                     + gyro_lpf_val * gyro_lpf_rc / (gyro_lpf_rc + dt_lpf);
-        float motor_ref = PIDCalculate(&yaw_speed_pid, gyro_lpf_val, target_vel_rad); // 统一 rad/s
-
-        debugtest = motor_ref;
-        DMMotorSetRef(yaw_motor, motor_ref);
     }
 
     //调云台时候解除注释再改

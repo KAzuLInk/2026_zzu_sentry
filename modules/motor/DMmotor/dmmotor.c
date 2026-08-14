@@ -464,7 +464,7 @@ void DMMotorTask(void const *argument)
         if (motor->native_mode == DM_NATIVE_MODE_POSVEL)
         {
             float p_cmd = set;
-            float v_cmd = 2.0f;
+            float v_cmd = 4.0f;
             memcpy(&motor->motor_can_instace->tx_buff[0], &p_cmd, 4);
             memcpy(&motor->motor_can_instace->tx_buff[4], &v_cmd, 4);
         }
