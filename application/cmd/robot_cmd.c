@@ -85,7 +85,7 @@ void RobotCMDInit()
 {
     rc_data = RemoteControlInit(&huart5); // 修改为对应串口,注意如果是自研板dbus协议串口需选用添加了反相器的那个
     // nav_recv_data = NavInit(&huart9);
-    vision_recv_data = VisionInit(&huart10, syncWithVisionSystem); // 视觉通信串口
+    vision_recv_data = VisionInit(); // 视觉通信（USB 虚拟串口 VCP）
     // Referee_ToVision_data=RefereeInit(&huart1);  不需要在chassic的UI初始化中嵌套的有
     buffer_yaw = BUFRegister();
     buffer_pitch = BUFRegister();
@@ -549,11 +549,10 @@ void RobotCMDTask()
                       INS_CMD.Pitch,
                       INS_CMD.Roll); //
 
-    VisionRefree_SetAltitude((float)24.0f,
-                             (float)Referee_ToVision_data.life,
-                             (float)Referee_ToVision_data.color,
-                             (float)Referee_ToVision_data.allowance_17mm,
-                             (float)game_start_flag);
+    VisionSetBattery(24000, 0, 0); // 电池电压 24V 标称值占位，电流/电量待接超级电容后补真实值
+    VisionSetStatus(Referee_ToVision_data.game_progress,
+                    Referee_ToVision_data.life,
+                    0);
 
     Vision_Send_All(); // DMA连续发会堵塞，写了一个状态机来在两个周期分别发
 

@@ -31,7 +31,6 @@
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
-typedef void (*USBCallback)(uint16_t len);  // USB收发回调类型
 static USBCallback usb_tx_callback = NULL;  //指针指向发送数据
 static USBCallback usb_rx_callback = NULL;  //指针指向接收数据
 /* USER CODE END PV */

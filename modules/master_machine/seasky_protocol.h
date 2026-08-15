@@ -6,9 +6,11 @@
 #include <string.h>
 
 #define PROTOCOL_CMD_ID 0XA5
-#define OFFSET_BYTE 8 // 出数据段外，其他部分所占字节数
+#define SEASKY_MAX_PAYLOAD_LEN 128 // 单帧 payload 上限（当前最大为底盘反馈 32B）
 
-/* ==================== 旧协议（保留，供旧 UART 视觉链路使用） ==================== */
+/* ==================== 旧协议（已废弃，仅注释保留） ==================== */
+/*
+#define OFFSET_BYTE 8 // 出数据段外，其他部分所占字节数
 
 typedef struct
 {
@@ -22,7 +24,7 @@ typedef struct
 	uint16_t frame_tail;   // 帧尾CRC校验
 } protocol_rm_struct;
 
-/*更新发送数据帧，并计算发送数据帧长度*/
+// 更新发送数据帧，并计算发送数据帧长度
 void get_protocol_send_data(uint16_t send_id,		 // 信号id
 							uint16_t flags_register, // 16位寄存器
 							float *tx_data,			 // 待发送的float数据
@@ -30,10 +32,11 @@ void get_protocol_send_data(uint16_t send_id,		 // 信号id
 							uint8_t *tx_buf,		 // 待发送的数据帧
 							uint16_t *tx_buf_len);	 // 待发送的数据帧长度
 
-/*接收数据处理*/
+// 接收数据处理
 uint16_t get_protocol_info(uint8_t *rx_buf,			 // 接收到的原始数据
 						   uint16_t *flags_register, // 接收数据的16位寄存器地址
 						   uint8_t *rx_data);		 // 接收的float数据存储地址
+*/
 
 /* ==================== V1 协议（USB 虚拟串口，见 USB协议与类使用说明_V1.md） ==================== */
 
@@ -60,6 +63,7 @@ uint16_t get_protocol_info(uint8_t *rx_buf,			 // 接收到的原始数据
 #define MSG_ID_BATTERY       0x13 /* 电池 voltage+current+capacity */
 #define MSG_ID_ROBOT_STATUS  0x14 /* 状态 mode+hp+error */
 #define MSG_ID_HEARTBEAT_ACK 0x1F /* 心跳响应（空负载） */
+/* MSG_ID_REFEREE 0x20 已废弃：裁判/哨兵状态改由 0x13(电池)+0x14(状态) 回传 */
 
 /* V1 组帧：payload 打包写入 tx_buf，返回帧总长（6+payload_len） */
 uint16_t seasky_send(uint8_t msg_id, const uint8_t *payload, uint16_t payload_len,

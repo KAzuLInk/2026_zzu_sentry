@@ -6,7 +6,9 @@
 
 #define VISION_RECV_SIZE 36u // 原来是18.可以正常接收yaw和pitch,现在改成36测试接收第三个数据shoot。
 #define Nav_RECV_SIZE 22u
-#define VISION_SEND_SIZE 36u
+#define VISION_SEND_SIZE 42u
+#define CHASSIS_MOTOR_COUNT 4 // 底盘电机数量
+#define GIMBAL_MOTOR_COUNT 2  // 云台电机数量(yaw, pitch)
 
 #pragma pack(1)
 typedef enum
@@ -107,60 +109,102 @@ typedef struct
 } Vision_Send_s;
 
 
+/* 电池信息回传，msg_id=0x13，payload=5B */
 typedef struct
 {
-	// Enemy_Color_e enemy_color;
-	// Work_Mode_e work_mode;
-	// Bullet_Speed_e bullet_speed;
+	uint16_t voltage;   // 电压 (mV)
+	uint16_t current;   // 电流 (mA)
+	uint8_t  capacity;  // 电量百分比 (0~100)
+} Vision_Battery_Send_s;
 
+/* 机器人状态回传，msg_id=0x14，payload=4B */
+typedef struct
+{
+	uint8_t  mode;   // 机器人模式（当前取裁判系统 game_progress）
+	uint16_t hp;     // 血量
+	uint8_t  error;  // 错误码 (0=正常)
+} Vision_Status_Send_s;
 
-	float battery;
-	float life;
-	float color;
-	float bullet;
-	float game_mode;
-} Vision_Refree_Send_s;
+/* ==================== 上行反馈结构（电控 -> 上位机） ==================== */
+
+/* 单个电机反馈：speed int16 + pos int32 + cur int16 = 8B（需 pack(1)） */
+typedef struct
+{
+    int16_t speed;
+    int32_t pos;
+    int16_t cur;
+} Vision_Send_motor;
+
+/* 底盘 4 电机反馈，msg_id=0x10，payload=32B */
+typedef struct
+{
+    Vision_Send_motor motors[CHASSIS_MOTOR_COUNT];
+} Vision_Chassis_Motors_s;
+
+/* 云台 2 电机反馈，msg_id=0x11，payload=16B */
+typedef struct
+{
+    Vision_Send_motor motors[GIMBAL_MOTOR_COUNT];
+} Vision_Gimbal_Motors_s;
+
+/* IMU 数据，msg_id=0x12，payload=24B */
+typedef struct
+{
+    float yaw;
+    float pitch;
+    float roll;
+    float gyro_x;
+    float gyro_y;
+    float gyro_z;
+} Vision_IMU_Send_s;
+
+/* ==================== 下行接收结构（上位机 -> 电控） ==================== */
+
+/* 综合控制 fix_control，msg_id=0x05，payload=22B */
+typedef struct
+{
+    uint8_t flags; // bit0=锁敌
+    float yaw;
+    float pitch;
+    uint8_t fire;  // 0/1 开火
+    float vx;
+    float vy;
+    float vz;      // 与视觉组约定：复用为 spin（小陀螺旋转角速度）
+} Vision_Fix_Ctrl_s;
 #pragma pack()
 
 /**
- * @brief 调用此函数初始化和视觉的串口通信
- *
- * @param handle 用于和视觉通信的串口handle(C板上一般为USART1,丝印为USART2,4pin)
+ * @brief 调用此函数初始化视觉的 USB 虚拟串口通信（VCP）
  */
-Vision_Recv_s *VisionInit(UART_HandleTypeDef *_handle, void (*application_callback)(void));
-Nav_Recv_s *NavInit(UART_HandleTypeDef *_handle);
-/**
- * @brief 发送视觉数据
- *
- */
-void VisionSend();
+Vision_Recv_s *VisionInit(void);
 
 /**
- * @brief 设置视觉发送标志位
- *
- * @param enemy_color
- * @param work_mode
- * @param bullet_speed
- */
-// void VisionSetFlag(Enemy_Color_e enemy_color, Work_Mode_e work_mode, Bullet_Speed_e bullet_speed);
-
-/**
- * @brief 设置发送数据的姿态部分
- *
- * @param yaw
- * @param pitch
- * @param roll
- * @param battery
- * @param life
- * @param color
- * @param bullet
- * @param game_mode
-
+ * @brief 设置上行 IMU 姿态数据（电控 -> 上位机）
  */
 void VisionSetAltitude(float yaw, float pitch, float roll);
-void VisionRefree_SetAltitude(float battery, float life, float color, float bullet, float game_mode);
-void Vision_Refree_Send();
-void Vision_Send_All(void);
+
+/**
+ * @brief 设置电池信息回传数据（电控 -> 上位机）
+ */
+void VisionSetBattery(uint16_t voltage, uint16_t current, uint8_t capacity);
+
+/**
+ * @brief 设置机器人状态回传数据（电控 -> 上位机）
+ */
+void VisionSetStatus(uint8_t mode, uint16_t hp, uint8_t error);
+
+/* ====================== 上行反馈设置函数（电控 -> 上位机） ====================== */
+void VisionSetChassisMotors(int16_t *speed, int32_t *pos, int16_t *cur);
+void VisionSetGimbalMotors(int16_t *speed, int32_t *pos, int16_t *cur);
+void VisionSetIMU(float yaw, float pitch, float roll, float gx, float gy, float gz);
+
+/* ====================== 上行反馈发送函数 ====================== */
+void VisionSendChassis(void);  // msg_id=0x10
+void VisionSendGimbal(void);   // msg_id=0x11
+void VisionSendIMU(void);      // msg_id=0x12
+void VisionSendBattery(void);  // msg_id=0x13
+void VisionSendStatus(void);   // msg_id=0x14
+void Vision_Send_All(void);    // 状态机轮流发送
 
 
 #endif // !MASTER_PROCESS_H

@@ -15,7 +15,8 @@
 #include "crc16.h"
 #include "memory.h"
 
-/* ==================== 旧协议实现（保留，供旧 UART 视觉链路使用） ==================== */
+/* ==================== 旧协议实现（已废弃，#if 0 注释保留） ==================== */
+#if 0
 
 /*获取CRC8校验码*/
 uint8_t Get_CRC8_Check(uint8_t *pchMessage, uint16_t dwLength)
@@ -137,6 +138,8 @@ uint16_t get_protocol_info(uint8_t *rx_buf,          // 接收到的原始数据
     return 0;
 }
 
+#endif /* 旧协议实现 */
+
 /* ==================== V1 协议实现（USB 虚拟串口，见 USB协议与类使用说明_V1.md） ==================== */
 
 uint16_t seasky_send(uint8_t msg_id, const uint8_t *payload, uint16_t payload_len,
@@ -175,6 +178,12 @@ int16_t seasky_recv(uint8_t msg_id, const uint8_t *rx_buf, uint16_t rx_len,
         }
 
         len = rx_buf[i + 1] | ((uint16_t)rx_buf[i + 2] << 8);
+
+        if (len > SEASKY_MAX_PAYLOAD_LEN) /* 异常长度：按假帧头跳过，防止 payload 越界 */
+        {
+            i++;
+            continue;
+        }
 
         if (i + 6 + len > rx_len) /* 半帧：等下次补数 */
             return -1;

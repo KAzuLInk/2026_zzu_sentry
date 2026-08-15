@@ -1,10 +1,9 @@
 /**
  * @file master_process.c
  * @author neozng
- * @brief  module for recv&send vision data
+ * @brief  module for recv&send vision data (V1 协议，USB 虚拟串口 VCP)
  * @version beta
  * @date 2022-11-03
- * @todo 增加对串口调试助手协议的支持,包括vofa和serial debug
  * @copyright Copyright (c) 2022
  *
  */
@@ -15,209 +14,228 @@
 #include "robot_def.h"
 
 static Vision_Recv_s recv_data;
-static Vision_Send_s send_data;
-static Vision_Refree_Send_s send_data_refree;
-static Nav_Recv_s recv_data_nav;
-static DaemonInstance *vision_daemon_instance[2];
+static Vision_Chassis_Motors_s send_chassis_motors;
+static Vision_Gimbal_Motors_s send_gimbal_motors;
+static Vision_IMU_Send_s send_imu;
+static Vision_Battery_Send_s send_battery;
+static Vision_Status_Send_s send_status;
 
-// void VisionSetFlag(Enemy_Color_e enemy_color, Work_Mode_e work_mode, Bullet_Speed_e bullet_speed)
-// {
-//     send_data.enemy_color = enemy_color;
-//     send_data.work_mode = work_mode;
-//     send_data.bullet_speed = bullet_speed;
-// }
-
+/**
+ * @brief 设置上行 IMU 姿态数据（电控 -> 上位机）
+ * @attention 与旧实现保持一致：pitch/roll 交换（历史轴系约定）
+ */
 void VisionSetAltitude(float yaw, float pitch, float roll)
 {
-    send_data.yaw = yaw;
-    send_data.pitch = roll;
-    send_data.roll = pitch;
-}
-
-void VisionRefree_SetAltitude(float battery, float life, float color, float bullet, float game_mode)
-{
-
-    send_data_refree.battery = battery;
-    send_data_refree.life = life;
-    send_data_refree.color = color;
-    send_data_refree.bullet = bullet;
-    send_data_refree.game_mode = game_mode;
-}
-/**
- * @brief 离线回调函数,将在daemon.c中被daemon task调用
- * @attention 由于HAL库的设计问题,串口开启DMA接收之后同时发送有概率出现__HAL_LOCK()导致的死锁,使得无法
- *            进入接收中断.通过daemon判断数据更新,重新调用服务启动函数以解决此问题.
- *
- * @param id vision_usart_instance的地址,此处没用.
- */
-
-#ifdef VISION_USE_UART
-
-#include "bsp_usart.h"
-
-static USARTInstance *vision_usart_instance[2];
-static uint8_t idx;
-static void VisionOfflineCallback(void *id)
-{
-#ifdef VISION_USE_UART
-    USARTServiceInit(vision_usart_instance[0]);
-#endif // !VISION_USE_UART
-    LOGWARNING("[vision] vision offline, restart communication.");
+    send_imu.yaw = yaw;
+    send_imu.pitch = roll;
+    send_imu.roll = pitch;
 }
 
 /**
- * @brief 接收解包回调函数,将在bsp_usart.c中被usart rx callback调用
- * @todo  1.提高可读性,将get_protocol_info的第四个参数增加一个float类型buffer
- *        2.添加标志位解码
+ * @brief 设置电池信息回传数据（电控 -> 上位机）
  */
-static void (*vision_application_callback)(void);
-static void DecodeVision()
+void VisionSetBattery(uint16_t voltage, uint16_t current, uint8_t capacity)
 {
-    uint16_t flag_register;
-    DaemonReload(vision_daemon_instance[0]); // 喂狗
-    get_protocol_info(vision_usart_instance[0]->recv_buff, &flag_register, (uint8_t *)&recv_data.yaw);
-    vision_application_callback();
-    // TODO: code to resolve flag_register;
-}
-static void DecodeNav()
-{
-    uint16_t flag_register;
-    DaemonReload(vision_daemon_instance[1]); // 喂狗
-    get_protocol_info(vision_usart_instance[1]->recv_buff, &flag_register, (uint8_t *)&recv_data_nav.vx);
-    vision_application_callback();
-    // TODO: code to resolve flag_register;
-}
-Vision_Recv_s *VisionInit(UART_HandleTypeDef *_handle, void (*application_callback)(void))
-{
-    USART_Init_Config_s conf;
-    conf.module_callback = DecodeVision;
-    conf.recv_buff_size = VISION_RECV_SIZE;
-    conf.usart_handle = _handle;
-    vision_usart_instance[0] = USARTRegister(&conf);
-    vision_application_callback = application_callback;
-    // 为master process注册daemon,用于判断视觉通信是否离线
-    Daemon_Init_Config_s daemon_conf = {
-        .callback = VisionOfflineCallback, // 离线时调用的回调函数,会重启串口接收
-        .owner_id = vision_usart_instance[0],
-        .reload_count = 100,
-    };
-    vision_daemon_instance[0] = DaemonRegister(&daemon_conf);
-
-    return &recv_data;
-}
-
-Nav_Recv_s *NavInit(UART_HandleTypeDef *_handle)
-{
-    USART_Init_Config_s conf;
-    conf.module_callback = DecodeNav;
-    conf.recv_buff_size = Nav_RECV_SIZE;
-    conf.usart_handle = _handle;
-    vision_usart_instance[1] = USARTRegister(&conf);
-
-    // 为master process注册daemon,用于判断视觉通信是否离线
-    Daemon_Init_Config_s daemon_conf = {
-        .callback = VisionOfflineCallback, // 离线时调用的回调函数,会重启串口接收
-        .owner_id = vision_usart_instance[1],
-        .reload_count = 100,
-    };
-    vision_daemon_instance[1] = DaemonRegister(&daemon_conf);
-
-    return &recv_data_nav;
+    send_battery.voltage = voltage;
+    send_battery.current = current;
+    send_battery.capacity = capacity;
 }
 
 /**
- * @brief 发送函数
- *
- * @param send 待发送数据
- *
+ * @brief 设置机器人状态回传数据（电控 -> 上位机）
  */
-void VisionSend()
+void VisionSetStatus(uint8_t mode, uint16_t hp, uint8_t error)
 {
-    // buff和txlen必须为static,才能保证在函数退出后不被释放,使得DMA正确完成发送
-    // 析构后的陷阱需要特别注意!
-    static uint16_t flag_register;
-    static uint8_t send_buff[VISION_SEND_SIZE];
-    static uint16_t tx_len;
-    // TODO: code to set flag_register
-    flag_register = 30 << 8 | 0b00000001;
-    // 将数据转化为seasky协议的数据包
-    get_protocol_send_data(0x02, flag_register, &send_data.yaw, 3, send_buff, &tx_len);
-    USARTSend(vision_usart_instance[0], send_buff, tx_len, USART_TRANSFER_DMA); // 和视觉通信使用IT,防止和接收使用的DMA冲突
-    // 此处为HAL设计的缺陷,DMASTOP会停止发送和接收,导致再也无法进入接收中断.
-    // 也可在发送完成中断中重新启动DMA接收,但较为复杂.因此,此处使用IT发送.
-    // 若使用了daemon,则也可以使用DMA发送.
+    send_status.mode = mode;
+    send_status.hp = hp;
+    send_status.error = error;
 }
-
-void Vision_Refree_Send()
-{
-    // buff和txlen必须为static,才能保证在函数退出后不被释放,使得DMA正确完成发送
-    // 析构后的陷阱需要特别注意!
-    static uint16_t flag_register;
-    static uint8_t send_buff[VISION_SEND_SIZE];
-    static uint16_t tx_len;
-    // TODO: code to set flag_register
-    flag_register = 30 << 8 | 0b00000001;
-    // 将数据转化为seasky协议的数据包
-    get_protocol_send_data(0x20, flag_register, &send_data_refree.battery, 5, send_buff, &tx_len);
-    USARTSend(vision_usart_instance[0], send_buff, tx_len, USART_TRANSFER_DMA); // 和视觉通信使用IT,防止和接收使用的DMA冲突
-    // 此处为HAL设计的缺陷,DMASTOP会停止发送和接收,导致再也无法进入接收中断.
-    // 也可在发送完成中断中重新启动DMA接收,但较为复杂.因此,此处使用IT发送.
-    // 若使用了daemon,则也可以使用DMA发送.
-}
-
-void Vision_Send_All() {
-    static uint8_t i = 0;
-    if (i == 0) {
-        Vision_Refree_Send();
-        i++;
-    } else {
-        VisionSend();
-        i++;
-        if (i > 4) i = 0;
-    }
-}
-#endif // VISION_USE_UART
 
 #ifdef VISION_USE_VCP
 
 #include "bsp_usb.h"
-static uint8_t *vis_recv_buff;
 
-static void DecodeVision(uint16_t recv_len)
+static uint8_t *vis_recv_buff;
+static DaemonInstance *vision_daemon_instance;
+
+/**
+ * @brief 离线回调函数，VCP 模式下仅记录警告，USB 栈自行处理重连
+ */
+static void VisionOfflineCallback(void *id)
 {
-    uint16_t flag_register;
-    get_protocol_info(vis_recv_buff, &flag_register, (uint8_t *)&recv_data.pitch);
-    // TODO: code to resolve flag_register;
+    UNUSED(id);
+    LOGWARNING("[vision] vision offline via VCP, check USB connection.");
 }
 
-/* 视觉通信初始化 */
-Vision_Recv_s *VisionInit(UART_HandleTypeDef *_handle)
+/**
+ * @brief 接收解包回调，由 USB CDC 接收中断调用（CDC_Receive_HS -> usb_rx_callback）
+ *        解析上位机下发的控制帧，写入 recv_data。
+ */
+static void DecodeVision(uint16_t recv_len)
 {
-    UNUSED(_handle); // 仅为了消除警告
+    static uint8_t payload[SEASKY_MAX_PAYLOAD_LEN];
+    uint16_t len = 0;
+    Vision_Fix_Ctrl_s fix;
+
+    // 综合控制 0x05：flags + yaw + pitch + fire + vx + vy + vz（22B）
+    if (seasky_recv(MSG_ID_FIX_CTRL, vis_recv_buff, recv_len, payload, &len) >= 0 &&
+        len >= sizeof(Vision_Fix_Ctrl_s))
+    {
+        memcpy(&fix, payload, sizeof(Vision_Fix_Ctrl_s));
+        recv_data.yaw   = fix.yaw;
+        recv_data.pitch = fix.pitch;
+        recv_data.shoot = fix.fire;
+        recv_data.vx    = fix.vx;
+        recv_data.vy    = fix.vy;
+        recv_data.spin  = fix.vz; // 与视觉组约定：vz 复用为 spin（小陀螺旋转角速度），视觉组需在此填 spin 而非 0
+        recv_data.target_state = (fix.flags & 0x01) ? READY_TO_FIRE : NO_TARGET;
+        DaemonReload(vision_daemon_instance);
+        return;
+    }
+
+    // 云台控制 0x02：flags + yaw + pitch（9B）
+    if (seasky_recv(MSG_ID_GIMBAL_CTRL, vis_recv_buff, recv_len, payload, &len) >= 0 &&
+        len >= 9)
+    {
+        recv_data.target_state = (payload[0] & 0x01) ? READY_TO_FIRE : NO_TARGET;
+        memcpy(&recv_data.yaw,   &payload[1], 4);
+        memcpy(&recv_data.pitch, &payload[5], 4);
+        DaemonReload(vision_daemon_instance);
+        return;
+    }
+}
+
+/**
+ * @brief 初始化视觉 VCP 通信
+ */
+Vision_Recv_s *VisionInit(void)
+{
     USB_Init_Config_s conf = {.rx_cbk = DecodeVision};
     vis_recv_buff = USBInit(conf);
 
-    // 为master process注册daemon,用于判断视觉通信是否离线
+    // 为 master process 注册 daemon，用于判断视觉通信是否离线
     Daemon_Init_Config_s daemon_conf = {
-        .callback = VisionOfflineCallback, // 离线时调用的回调函数,会重启串口接收
+        .callback = VisionOfflineCallback, // 离线时调用的回调函数
         .owner_id = NULL,
-        .reload_count = 5, // 50ms
+        .reload_count = 100, // 离线超过 1s 超时
     };
     vision_daemon_instance = DaemonRegister(&daemon_conf);
 
     return &recv_data;
 }
 
-void VisionSend()
+/* ====================== 上行反馈设置函数（电控 -> 上位机） ====================== */
+
+void VisionSetChassisMotors(int16_t *speed, int32_t *pos, int16_t *cur)
 {
-    static uint16_t flag_register;
-    static uint8_t send_buff[VISION_SEND_SIZE];
-    static uint16_t tx_len;
-    // TODO: code to set flag_register
-    flag_register = 30 << 8 | 0b00000001;
-    // 将数据转化为seasky协议的数据包
-    get_protocol_send_data(0x02, flag_register, &send_data.yaw, 3, send_buff, &tx_len);
-    USBTransmit(send_buff, tx_len);
+    for (uint8_t i = 0; i < CHASSIS_MOTOR_COUNT; i++)
+    {
+        send_chassis_motors.motors[i].speed = speed[i];
+        send_chassis_motors.motors[i].pos   = pos[i];
+        send_chassis_motors.motors[i].cur   = cur[i];
+    }
+}
+
+void VisionSetGimbalMotors(int16_t *speed, int32_t *pos, int16_t *cur)
+{
+    for (uint8_t i = 0; i < GIMBAL_MOTOR_COUNT; i++)
+    {
+        send_gimbal_motors.motors[i].speed = speed[i];
+        send_gimbal_motors.motors[i].pos   = pos[i];
+        send_gimbal_motors.motors[i].cur   = cur[i];
+    }
+}
+
+void VisionSetIMU(float yaw, float pitch, float roll, float gx, float gy, float gz)
+{
+    send_imu.yaw   = yaw;
+    send_imu.pitch = pitch;
+    send_imu.roll  = roll;
+    send_imu.gyro_x = gx;
+    send_imu.gyro_y = gy;
+    send_imu.gyro_z = gz;
+}
+
+/* ====================== 上行反馈发送函数 ====================== */
+
+/**
+ * @brief 发送底盘电机反馈 msg_id=0x10，payload=32B
+ */
+void VisionSendChassis(void)
+{
+    static uint8_t send_buf[VISION_SEND_SIZE];
+    uint16_t tx_len = seasky_send(MSG_ID_CHASSIS_FB, (uint8_t *)&send_chassis_motors,
+                                  sizeof(send_chassis_motors), send_buf);
+    USBTransmit(send_buf, tx_len);
+}
+
+/**
+ * @brief 发送云台电机反馈 msg_id=0x11，payload=16B
+ */
+void VisionSendGimbal(void)
+{
+    static uint8_t send_buf[VISION_SEND_SIZE];
+    uint16_t tx_len = seasky_send(MSG_ID_GIMBAL_FB, (uint8_t *)&send_gimbal_motors,
+                                  sizeof(send_gimbal_motors), send_buf);
+    USBTransmit(send_buf, tx_len);
+}
+
+/**
+ * @brief 发送 IMU 数据 msg_id=0x12，payload=24B
+ */
+void VisionSendIMU(void)
+{
+    static uint8_t send_buf[VISION_SEND_SIZE];
+    uint16_t tx_len = seasky_send(MSG_ID_IMU, (uint8_t *)&send_imu,
+                                  sizeof(send_imu), send_buf);
+    USBTransmit(send_buf, tx_len);
+}
+
+/**
+ * @brief 发送电池信息 msg_id=0x13，payload=5B
+ */
+void VisionSendBattery(void)
+{
+    static uint8_t send_buf[VISION_SEND_SIZE];
+    uint16_t tx_len = seasky_send(MSG_ID_BATTERY, (uint8_t *)&send_battery,
+                                  sizeof(send_battery), send_buf);
+    USBTransmit(send_buf, tx_len);
+}
+
+/**
+ * @brief 发送机器人状态 msg_id=0x14，payload=4B
+ */
+void VisionSendStatus(void)
+{
+    static uint8_t send_buf[VISION_SEND_SIZE];
+    uint16_t tx_len = seasky_send(MSG_ID_ROBOT_STATUS, (uint8_t *)&send_status,
+                                  sizeof(send_status), send_buf);
+    USBTransmit(send_buf, tx_len);
+}
+
+/**
+ * @brief 综合发送状态机：轮流发送 IMU / 电池 / 状态数据，避免 DMA 连续发送堵塞。
+ *        调用频率 100Hz（RobotCMDTask 周期 10ms），10 个相位 = 100ms 一轮：
+ *        电池 @ 10Hz，状态 @ 10Hz，IMU @ 80Hz。
+ */
+void Vision_Send_All(void)
+{
+    static uint8_t phase = 0;
+    phase++;
+    if (phase >= 10) phase = 0;
+
+    if (phase == 0)
+    {
+        VisionSendBattery(); // 电池信息 @ 10Hz
+    }
+    else if (phase == 1)
+    {
+        VisionSendStatus();  // 机器人状态 @ 10Hz
+    }
+    else
+    {
+        VisionSendIMU();     // IMU @ 80Hz
+    }
 }
 
 #endif // VISION_USE_VCP
