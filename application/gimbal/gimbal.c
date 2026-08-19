@@ -18,6 +18,7 @@ static Gimbal_Ctrl_Cmd_s gimbal_cmd_recv;         // 来自cmd的控制信息
 static Chassis_Upload_Data_s chassis_fetch_data; // 从底盘应用接收的反馈信息信息,底盘功率枪口热量与底盘运动状态等
 static DMMotorInstance *yaw_motor; //达妙4310大yaw CAN1
 static DJIMotorInstance *small_yaw_motor; //GM6020小yaw CAN2
+static Vision_Recv_s *vision_data; // 视觉接收数据(右中自瞄用, 懒加载)
 static float speed_forward;
 static float rotate_compensator;
 
@@ -244,7 +245,7 @@ void GimbalInit()
  *  内环(速度): Gyro[2] 反馈, 跟踪角度环输出的目标角速度, 提供阻尼
  *  级联输出 → DMMotorSetRef → MIT velocity_des
  */
-float debugtest; // 诊断用: yaw速度环输出 → DMMotorSetRef
+volatile float yaw_motor_ref_debug; // 诊断用: 大yaw速度指令 → DMMotorSetRef
 float gyro_lpf_val;          // 陀螺仪滤波后的值 (rad/s)
 float gyro_lpf_rc = 0.03f;    // LPF的RC常数, Ozone可改: 越大滤波越强
 uint32_t gyro_lpf_dwt;       // LPF时间戳
@@ -262,6 +263,7 @@ volatile float yaw_speed_ref_deg = 150.0f;  // 速控满偏角速度 °/s, Ozone
 static uint16_t small_yaw_home_ecd = 0;     // 小yaw上电锁定位(速控模式用)
 static uint8_t  small_yaw_ctl_init = 0;     // 小yaw闭环初始化标志
 static uint8_t  last_speed_control = 0;     // 上一拍是否速控(用于切回时重锁定)
+static uint8_t  last_vision_track = 0;      // 上一拍是否视觉跟踪(锁敌), 用于切入时重锁定
 
 // 小yaw主控 — 大yaw回中曲线 (Ozone可调)
 volatile float recenter_max_vel  = 150.0f;  // 边缘处大yaw回中角速度上限 °/s (= 60×2.5)
@@ -271,11 +273,98 @@ volatile float recenter_exp      = 3.0f;    // 曲线指数: 2=平方, 3=三次�
 volatile float recenter_debug    = 0.0f;    // 诊断: 当前回中角速度 °/s
 static uint32_t recenter_dwt     = 0;       // 回中积分时间戳
 
+// 视觉俯仰映射
+volatile float pitch_vision_horizon = 0.020f;  // 视觉pitch=0°(水平)对应的电机位置(rad)
+volatile float pitch_vision_min     = -0.78f;  // 俯仰下极限(rad)
+volatile float pitch_vision_max     = 0.022f;  // 俯仰上极限(rad)
+volatile float pitch_vision_dir     = 1.0f;    // 方向: 1=视觉向上=位置增大, -1=反向
+
+// 视觉射击到位诊断（Ozone直接观察）
+volatile float vision_align_tolerance_deg;
+volatile float vision_align_yaw_target_deg;
+volatile float vision_align_yaw_actual_deg;
+volatile float vision_align_yaw_error_deg;
+volatile float vision_align_pitch_target_rad;
+volatile float vision_align_pitch_actual_rad;
+volatile float vision_align_pitch_error_deg;
+volatile uint8_t vision_align_yaw_ready;
+volatile uint8_t vision_align_pitch_ready;
+volatile uint8_t vision_align_ready;
+
+/* 角度环绕: 把 target 折到 current 最近邻表示(±180内), 返回绝对角 */
+static float WrapAngleDeg(float target, float current)
+{
+    float error = target - current;
+    while (error > 180.0f) error -= 360.0f;
+    while (error < -180.0f) error += 360.0f;
+    return current + error;
+}
+
+/* 小yaw位置闭环到指定ecd(绝对值映射, 不累积), 带机械限位 */
+static void SmallYawSetEcd(uint16_t ecd_target)
+{
+    if (small_yaw_motor == NULL || small_yaw_motor->feed_cnt <= 0)
+        return;
+    uint16_t ecd = small_yaw_motor->measure.ecd;
+    // 限位: 顶到限位时不反向拉, 且目标不超机械范围
+    if (ecd > 2250 && ecd_target > ecd) ecd_target = ecd;
+    if (ecd < 405  && ecd_target < ecd) ecd_target = ecd;
+    if (ecd_target > 2250) ecd_target = 2250;
+    if (ecd_target < 405)  ecd_target = 405;
+    float total_ref = small_yaw_motor->measure.total_angle
+                    + ((float)ecd_target - (float)ecd) * ECD_ANGLE_COEF_DJI;
+    DJIMotorSetRef(small_yaw_motor, total_ref);
+    small_yaw_debug = total_ref;
+    small_yaw_ecd   = ecd;
+}
+
+/* 小yaw偏离中心(1300)→大yaw回中角速度(°/s), 三次方曲线 */
+static float RecenterVel(void)
+{
+    float recenter_vel = 0.0f;
+    if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0)
+    {
+        float off = (float)small_yaw_motor->measure.ecd - 1300.0f; // 右正左负
+        float mag = off < 0.0f ? -off : off;
+        if (mag > recenter_deadband)
+        {
+            float x = (mag - recenter_deadband) / (recenter_sat - recenter_deadband);
+            if (x > 1.0f) x = 1.0f;
+            float sign = off > 0.0f ? 1.0f : -1.0f;
+            recenter_vel = sign * recenter_max_vel * powf(x, recenter_exp);
+        }
+    }
+    recenter_debug = recenter_vel;
+    return recenter_vel;
+}
+
+/* 大yaw角度环 + 速度环 → DMMotorSetRef, ref为惯性空间绝对角(°) */
+static void BigYawAngleControl(float angle_ref)
+{
+    if (gimba_IMU_data == NULL)
+        return;
+    float current_angle = gimba_IMU_data->YawTotalAngle;
+    float target_vel = PIDCalculate(&yaw_angle_pid, current_angle, angle_ref); // °/s
+    float target_vel_rad = target_vel * DEGREE_2_RAD;                          // °/s → rad/s
+    float current_gyro_z = gimba_IMU_data->Gyro[2] * GYRO2GIMBAL_DIR_YAW;      // rad/s
+    // 陀螺仪输入低通滤波 — 切断机械振动→速度环的正反馈路径
+    float dt_lpf = DWT_GetDeltaT(&gyro_lpf_dwt);
+    if (dt_lpf > 0.01f) dt_lpf = 0.001f;
+    gyro_lpf_val = current_gyro_z * dt_lpf / (gyro_lpf_rc + dt_lpf)
+                 + gyro_lpf_val * gyro_lpf_rc / (gyro_lpf_rc + dt_lpf);
+    float motor_ref = target_vel_rad + PIDCalculate(&yaw_speed_pid, gyro_lpf_val, target_vel_rad);
+    yaw_motor_ref_debug = motor_ref;
+    DMMotorSetRef(yaw_motor, motor_ref);
+}
+
 void GimbalTask()
 {
     uint8_t sw_right    = rc_data[TEMP].rc.switch_right;
     uint8_t sw_left     = rc_data[TEMP].rc.switch_left;
     uint8_t remote_mode = switch_is_down(sw_right); // 右下 = 遥控器模式
+    uint8_t vision_mode = switch_is_mid(sw_right);  // 右中 = 视觉自瞄模式
+    uint8_t vision_online = 0;
+    uint8_t vision_locked = 0;
 
     // 小yaw初始化(上电一次): 闭环类型 + 锁定初始位
     if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0 && !small_yaw_ctl_init)
@@ -286,14 +375,14 @@ void GimbalTask()
         small_yaw_ctl_init = 1;
     }
 
-    // 子模式: 右下 + 左上 = 失能 → 停所有电机
-    if (remote_mode && switch_is_up(sw_left))
+    // 子模式: (右下或右中) + 左上 = 失能 → 停所有电机
+    if ((remote_mode || vision_mode) && switch_is_up(sw_left))
     {
         // 大yaw(MIT): vel_des=0 配合 Kd=2.0 主动阻尼刹车
         //   (DMMotorStop发全0帧, Kd=0被固件拒收→电机疯转, 不能用)
         DMMotorSetRef(yaw_motor, 0);
-        // Pitch(POSVEL): 失能回到安全位 0.2 rad (在行程范围 0~0.48 内)
-        DMMotorSetRef(pitch_motor, 0.2f);
+        // Pitch(POSVEL): 失能回到安全位 0.001 rad (在行程范围 -0.78~0.022 内)
+        DMMotorSetRef(pitch_motor, 0.001f);
         // 小yaw(GM6020): 0电流失能
         if (small_yaw_motor != NULL) DJIMotorStop(small_yaw_motor);
         yaw_angle_ref_locked = 0; // 重新使能后重锁定当前角, 防猛转回旧ref
@@ -312,11 +401,74 @@ void GimbalTask()
         yaw_angle_ref_locked = 0;
     last_speed_control = speed_control;
 
-    // 懒加载IMU数据指针
+    // 懒加载IMU数据指针 + 视觉数据指针
     if (gimba_IMU_data == NULL)
         gimba_IMU_data = INS_Init();
+    if (vision_data == NULL)
+        vision_data = VisionGetRecv();
 
-    if (speed_control)
+    if (vision_mode)
+    {
+        // ====== 视觉自瞄模式 (右中切换) ======
+        // 未锁敌: 大yaw带动小yaw寻敌 (大yaw指向视觉yaw, 小yaw回中)
+        // 锁敌:   小yaw带动大yaw跟踪 (小yaw精细跟踪残差, 大yaw回中曲线跟随)
+        vision_online = VisionIsOnline();
+        vision_locked = vision_online && vision_data != NULL
+                        && vision_data->target_state == READY_TO_FIRE;
+
+        // 进入/退出跟踪子模式: 重锁大yaw目标角, 防角度跳变
+        if (vision_locked != last_vision_track)
+            yaw_angle_ref_locked = 0;
+        last_vision_track = vision_locked;
+
+        if (vision_locked)
+        {
+            // ---- 锁敌: 小yaw带动大yaw ----
+            // 小yaw主动跟踪: 视觉yaw是小yaw相对中位的目标偏角(度)，大yaw只负责从动回中
+            if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0)
+            {
+                float ecd_target = 1300.0f
+                                 + vision_data->yaw / ECD_ANGLE_COEF_DJI;
+                if (ecd_target > 2250.0f) ecd_target = 2250.0f;
+                else if (ecd_target < 405.0f) ecd_target = 405.0f;
+                SmallYawSetEcd((uint16_t)ecd_target);
+            }
+            // 大yaw: 回中曲线(小yaw偏离中心越多, 大yaw回中越快) + 角度环
+            if (gimba_IMU_data != NULL)
+            {
+                if (!yaw_angle_ref_locked)
+                {
+                    yaw_angle_ref = gimba_IMU_data->YawTotalAngle;
+                    yaw_angle_ref_locked = 1;
+                }
+                float recenter_vel = RecenterVel();
+                float dt = DWT_GetDeltaT(&recenter_dwt);
+                if (dt > 0.02f) dt = 0.01f;
+                yaw_angle_ref += recenter_vel * dt;
+                BigYawAngleControl(yaw_angle_ref);
+            }
+        }
+        else
+        {
+            // ---- 未锁敌/离线: 大yaw带动小yaw寻敌 (离线时大yaw锁当前角保持) ----
+            SmallYawSetEcd(1300); // 小yaw回中
+            if (gimba_IMU_data != NULL)
+            {
+                if (vision_online && vision_data != NULL)
+                    BigYawAngleControl(WrapAngleDeg(vision_data->yaw, gimba_IMU_data->YawTotalAngle)); // 大yaw寻敌扫描
+                else
+                {
+                    if (!yaw_angle_ref_locked) // 视觉离线: 锁当前角保持
+                    {
+                        yaw_angle_ref = gimba_IMU_data->YawTotalAngle;
+                        yaw_angle_ref_locked = 1;
+                    }
+                    BigYawAngleControl(yaw_angle_ref);
+                }
+            }
+        }
+    }
+    else if (speed_control)
     {
         // ====== 速控模式 ======
         // 小yaw: 锁死在上电初始位
@@ -344,37 +496,21 @@ void GimbalTask()
                          + gyro_lpf_val * gyro_lpf_rc / (gyro_lpf_rc + dt_lpf);
             float motor_ref = target_vel_rad + PIDCalculate(&yaw_speed_pid, gyro_lpf_val, target_vel_rad);
 
-            debugtest = motor_ref;
+            yaw_motor_ref_debug = motor_ref;
             DMMotorSetRef(yaw_motor, motor_ref);
         }
     }
     else
     {
-        // ====== 跟随模式(现有逻辑) ======
+        // ====== 跟随模式 ======
         // 小Yaw: 位置模式 — 摇杆→ecd→total_angle, 绝对值映射不累积
-        if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0)
-        {
-            // 摇杆线性映射: +660→405ecd, 0→中位, -660→2250ecd (ecd增大为正方向)
-            float stick = -rc_data[TEMP].rc.rocker_r_;
-            float ratio = (stick + 660.0f) / 1320.0f;
-            if (ratio > 1.0f) ratio = 1.0f;
-            if (ratio < 0.0f) ratio = 0.0f;
-            float ecd_target = 405.0f + ratio * (2250.0f - 405.0f);
-
-            // 限位
-            uint16_t ecd = small_yaw_motor->measure.ecd;
-            if (ecd > 2250 && ecd_target > ecd) ecd_target = ecd;
-            if (ecd < 405  && ecd_target < ecd) ecd_target = ecd;
-            if (ecd_target > 2250) ecd_target = 2250;
-            if (ecd_target < 405)  ecd_target = 405;
-
-            // 绝对值(度): total_angle = 当前total + (目标ecd - 当前ecd) * 每格度数
-            float total_ref = small_yaw_motor->measure.total_angle + (ecd_target - (float)ecd) * ECD_ANGLE_COEF_DJI;
-            DJIMotorSetRef(small_yaw_motor, total_ref);
-
-            small_yaw_debug = total_ref;
-            small_yaw_ecd   = ecd;
-        }
+        // 摇杆线性映射: +660→405ecd, 0→中位, -660→2250ecd (ecd增大为正方向)
+        float stick = -rc_data[TEMP].rc.rocker_r_;
+        float ratio = (stick + 660.0f) / 1320.0f;
+        if (ratio > 1.0f) ratio = 1.0f;
+        if (ratio < 0.0f) ratio = 0.0f;
+        float ecd_target = 405.0f + ratio * (2250.0f - 405.0f);
+        SmallYawSetEcd((uint16_t)ecd_target);
 
         // 大yaw: IMU自稳(锁绝对角) + 小yaw回中(偏离中心越大角度偏移越大)
         if (gimba_IMU_data != NULL)
@@ -385,46 +521,20 @@ void GimbalTask()
                 yaw_angle_ref_locked = 1;
             }
 
-            // 回中曲线: 小yaw偏离中心(1300)越多, 回中角速度越大(三次方/平方), 积分进角度ref
-            float recenter_vel = 0.0f;
-            if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0)
-            {
-                float off = (float)small_yaw_motor->measure.ecd - 1300.0f; // 有符号: 右正左负
-                float mag = off < 0.0f ? -off : off;
-                if (mag > recenter_deadband)
-                {
-                    float x = (mag - recenter_deadband) / (recenter_sat - recenter_deadband);
-                    if (x > 1.0f) x = 1.0f;
-                    float sign = off > 0.0f ? 1.0f : -1.0f;
-                    recenter_vel = sign * recenter_max_vel * powf(x, recenter_exp); // °/s
-                }
-            }
-            recenter_debug = recenter_vel;
-
+            // 回中曲线: 小yaw偏离中心越多, 回中角速度越大, 积分进角度ref
+            float recenter_vel = RecenterVel();
             float dt = DWT_GetDeltaT(&recenter_dwt);
             if (dt > 0.02f) dt = 0.01f; // 首次调用/机械延迟防护, 100Hz下约10ms
             yaw_angle_ref += recenter_vel * dt; // 积分进角度ref
 
-            float current_angle = gimba_IMU_data->YawTotalAngle;
-            float target_vel = PIDCalculate(&yaw_angle_pid, current_angle, yaw_angle_ref); // °/s
-            float target_vel_rad = target_vel * DEGREE_2_RAD;  // °/s → rad/s
-            float current_gyro_z = gimba_IMU_data->Gyro[2] * GYRO2GIMBAL_DIR_YAW; // rad/s
-            // 陀螺仪输入低通滤波 — 切断机械振动→速度环的正反馈路径
-            float dt_lpf = DWT_GetDeltaT(&gyro_lpf_dwt);
-            if (dt_lpf > 0.01f) dt_lpf = 0.001f; // 首次调用防阶跃
-            gyro_lpf_val = current_gyro_z * dt_lpf / (gyro_lpf_rc + dt_lpf)
-                         + gyro_lpf_val * gyro_lpf_rc / (gyro_lpf_rc + dt_lpf);
-            float motor_ref = target_vel_rad + PIDCalculate(&yaw_speed_pid, gyro_lpf_val, target_vel_rad); // 统一 rad/s
-
-            debugtest = motor_ref;
-            DMMotorSetRef(yaw_motor, motor_ref);
+            BigYawAngleControl(yaw_angle_ref);
         }
     }
 
     rc_online = RemoteControlIsOnline(); // 看Ozone: 1=在线 0=离线
 
     // ====== Pitch轴: 原生位置速度模式, 摇杆直接映射到角度 ======
-    // 摇杆 -660~+660 → 角度 0.0~0.48 rad, 中位=0.24 rad
+    // 摇杆 -660~+660 → 角度 -0.78~0.022 rad
     if (pitch_motor != NULL)
     {
         static uint16_t startup_cnt = 0;
@@ -445,17 +555,41 @@ void GimbalTask()
             goto pitch_done;
         }
 
-        // 摇杆线性映射到机械范围
-        float hi = 0.48f, lo = 0.0f;
-        float stick = rc_data[TEMP].rc.rocker_r1;           // -660 ~ +660
-        float ratio = (stick + 660.0f) / 1320.0f;           // 0.0 ~ 1.0
-        if      (ratio > 1.0f) ratio = 1.0f;
-        else if (ratio < 0.0f) ratio = 0.0f;
-        pos_ref = lo + ratio * (hi - lo);                   // lo ~ hi
+        // 目标位置: 视觉模式用视觉pitch(度→rad), 否则摇杆映射
+        if (vision_mode)
+        {
+            // 右中默认保持水平，只有视觉明确报告锁敌成功才使用视觉 pitch。
+            pos_ref = pitch_vision_horizon;
+            if (vision_locked)
+            {
+                // 锁敌: 跟随视觉 pitch
+                float vp = vision_data->pitch;
+                if (vp > -90.0f && vp < 90.0f) // 异常数据过滤
+                {
+                    float pitch_ref = pitch_vision_horizon + vp * DEGREE_2_RAD * pitch_vision_dir;
+                    if (pitch_ref > pitch_vision_max) pitch_ref = pitch_vision_max;
+                    if (pitch_ref < pitch_vision_min) pitch_ref = pitch_vision_min;
+                    pos_ref = pitch_ref;
+                }
+                else
+                    pos_ref = pitch_motor->measure.position; // 视觉数据异常: 保持
+            }
+        }
+        else
+        {
+            // 摇杆线性映射到机械范围
+            float hi = 0.022f, lo = -0.78f;
+            float stick = rc_data[TEMP].rc.rocker_r1;           // -660 ~ +660
+            float ratio = (stick + 660.0f) / 1320.0f;           // 0.0 ~ 1.0
+            if      (ratio > 1.0f) ratio = 1.0f;
+            else if (ratio < 0.0f) ratio = 0.0f;
+            pos_ref = lo + ratio * (hi - lo);                   // lo ~ hi
+        }
 
+        pitch_debug_ref = pos_ref;
         DMMotorSetRef(pitch_motor, pos_ref);
         pitch_debug_torque = pitch_motor->measure.torque; // 顶限位时飙升
-        pitch_done:;
+    pitch_done:;
     }
 
     //调云台时候解除注释再改
@@ -534,4 +668,105 @@ void GimbalTask()
 
     // // 推送消息
     // PubPushMessage(gimbal_pub, (void *)&gimbal_feedback_data);
+}
+
+/*
+ * 视觉开火到位判定：
+ * yaw 比较视觉给定的小yaw目标偏角与小yaw编码器实际偏角；
+ * pitch 直接比较电机实际位置和视觉pitch对应的机械位置。
+ */
+uint8_t GimbalVisionTargetAligned(float tolerance_deg)
+{
+    if (tolerance_deg < 0.0f)
+        tolerance_deg = -tolerance_deg;
+
+    vision_align_tolerance_deg = tolerance_deg;
+    vision_align_yaw_ready = 0;
+    vision_align_pitch_ready = 0;
+    vision_align_ready = 0;
+
+    if (vision_data == NULL)
+        vision_data = VisionGetRecv();
+
+    if (!VisionIsOnline() || vision_data == NULL ||
+        vision_data->target_state != READY_TO_FIRE ||
+        pitch_motor == NULL ||
+        pitch_motor->motor_daemon == NULL ||
+        pitch_motor->motor_daemon->temp_count == 0)
+        return 0;
+
+    /*
+     * 射击时视觉yaw表示小yaw相对中位的目标偏角，
+     * 大yaw是从动回中轴，不参与小yaw到位误差计算。
+     */
+    float small_yaw_deg = 0.0f;
+    if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0)
+    {
+        small_yaw_deg = ((float)small_yaw_motor->measure.ecd - 1300.0f)
+                      * ECD_ANGLE_COEF_DJI;
+    }
+    float yaw_error = vision_data->yaw - small_yaw_deg;
+    if (yaw_error < 0.0f)
+        yaw_error = -yaw_error;
+
+    vision_align_yaw_target_deg = vision_data->yaw;
+    vision_align_yaw_actual_deg = small_yaw_deg;
+    vision_align_yaw_error_deg = yaw_error;
+    vision_align_yaw_ready = (yaw_error <= tolerance_deg) ? 1 : 0;
+
+    /* 使用与GimbalTask相同的视觉pitch→电机位置映射，并复用机械限位 */
+    float vp = vision_data->pitch;
+    if (!(vp > -90.0f && vp < 90.0f))
+        return 0;
+    float pitch_target = pitch_vision_horizon
+                       + vp * DEGREE_2_RAD * pitch_vision_dir;
+    if (pitch_target > pitch_vision_max) pitch_target = pitch_vision_max;
+    if (pitch_target < pitch_vision_min) pitch_target = pitch_vision_min;
+
+    float pitch_error = (pitch_motor->measure.position - pitch_target) * RAD_2_DEGREE;
+    if (pitch_error < 0.0f)
+        pitch_error = -pitch_error;
+
+    vision_align_pitch_target_rad = pitch_target;
+    vision_align_pitch_actual_rad = pitch_motor->measure.position;
+    vision_align_pitch_error_deg = pitch_error;
+    vision_align_pitch_ready = (pitch_error <= tolerance_deg) ? 1 : 0;
+    vision_align_ready = (vision_align_yaw_ready && vision_align_pitch_ready) ? 1 : 0;
+
+    return vision_align_ready;
+}
+
+/* 云台电机反馈：DM4310 量纲为 rad / rad/s / Nm，放大为整数回传（视觉侧按约定换算） */
+void GimbalGetMotorFeedback(int16_t speed[2], int32_t pos[2], int16_t cur[2])
+{
+    DMMotorInstance *motors[2] = {yaw_motor, pitch_motor};
+    for (uint8_t i = 0; i < 2; i++)
+    {
+        if (motors[i] == NULL)
+        {
+            speed[i] = 0;
+            pos[i]   = 0;
+            cur[i]   = 0;
+            continue;
+        }
+        speed[i] = (int16_t)(motors[i]->measure.velocity * 100.0f); // rad/s × 100
+        pos[i]   = (int32_t)(motors[i]->measure.position * 1000.0f); // rad × 1000 (mrad)
+        cur[i]   = (int16_t)(motors[i]->measure.torque   * 1000.0f); // Nm × 1000 (mNm)
+    }
+}
+
+/* 云台 pitch 轴电机位置（rad），0x12 回传的 small_pitch 字段使用 */
+float GimbalGetPitchPosition(void)
+{
+    if (pitch_motor == NULL)
+        return 0.0f;
+    return pitch_motor->measure.position;
+}
+
+/* 小yaw(GM6020)相对中心(1300ecd)的偏转角(度)，右正左负，0x12 回传的 small_yaw 字段 */
+float GimbalGetSmallYawPosition(void)
+{
+    if (small_yaw_motor == NULL)
+        return 0.0f;
+    return ((float)small_yaw_motor->measure.ecd - 1300.0f) * ECD_ANGLE_COEF_DJI;
 }

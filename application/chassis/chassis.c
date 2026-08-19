@@ -299,13 +299,19 @@ void ChassisTask()
 // ====== 插入结束，下面不改 ======
 #endif
 #ifdef CHASSIS_BOARD
-    // 默认急停,防止CAN噪声导致误动作;仅CAN通信在线且有新数据时才更新
-    chassis_cmd_recv.chassis_mode = CHASSIS_ZERO_FORCE;
-    chassis_cmd_recv.vx = 0;
-    chassis_cmd_recv.vy = 0;
-    chassis_cmd_recv.wz = 0;
+    // 在线且有新帧 → 更新指令；在线但本周期无新帧 → 保持上一帧(不清零,避免卡顿)
     if (CANCommIsOnline(chasiss_can_comm) && chasiss_can_comm->update_flag)
+    {
         chassis_cmd_recv = *(Chassis_Ctrl_Cmd_s *)CANCommGet(chasiss_can_comm);
+    }
+    // 真离线(daemon超时,约1s无帧) → 急停,防止CAN断线后电机失控
+    else if (!CANCommIsOnline(chasiss_can_comm))
+    {
+        chassis_cmd_recv.chassis_mode = CHASSIS_ZERO_FORCE;
+        chassis_cmd_recv.vx = 0;
+        chassis_cmd_recv.vy = 0;
+        chassis_cmd_recv.wz = 0;
+    }
 #endif // CHASSIS_BOARD
 
     // 仅在模式切换时改变电机使能状态,避免每周期重复设置
@@ -413,7 +419,28 @@ void ChassisTask()
     chassis_feedback_data.motor_current[2] = motor_lb->measure.real_current;
     chassis_feedback_data.motor_current[3] = motor_rb->measure.real_current;
 
+    // 编码器累计位置（脉冲数）：总圈数×8192 + 当前 ecd（0~8191）
+    chassis_feedback_data.motor_position[0] = motor_lf->measure.total_round * 8192 + motor_lf->measure.ecd;
+    chassis_feedback_data.motor_position[1] = motor_rf->measure.total_round * 8192 + motor_rf->measure.ecd;
+    chassis_feedback_data.motor_position[2] = motor_lb->measure.total_round * 8192 + motor_lb->measure.ecd;
+    chassis_feedback_data.motor_position[3] = motor_rb->measure.total_round * 8192 + motor_rb->measure.ecd;
+
     chassis_feedback_data.real_wz = chassis_cmd_recv.wz / REAL_WZ_RAT;
+
+#ifdef CHASSIS_BOARD
+    // 底盘板 IMU 姿态 + 角速度，经 CANComm 回传云台板（0x12 末尾追加字段）
+    {
+        float yaw, pitch, roll, gx, gy, gz;
+        INS_GetAttitude(&yaw, &pitch, &roll);
+        INS_GetGyro(&gx, &gy, &gz);
+        chassis_feedback_data.chassis_yaw    = yaw;
+        chassis_feedback_data.chassis_pitch  = pitch;
+        chassis_feedback_data.chassis_roll   = roll;
+        chassis_feedback_data.chassis_gyro_x = gx;
+        chassis_feedback_data.chassis_gyro_y = gy;
+        chassis_feedback_data.chassis_gyro_z = gz;
+    }
+#endif
 
     // 推送反馈消息
     In_Chsaais_Referee_To_Vision.life = referee_data->GameRobotState.current_HP;
@@ -426,6 +453,12 @@ void ChassisTask()
     PubPushMessage(UI_Referee_pub, (void *)&In_Chsaais_Referee_To_Vision);
 #endif
 #ifdef CHASSIS_BOARD
-    CANCommSend(chasiss_can_comm, (void *)&chassis_feedback_data);
+    // 底盘反馈(含IMU)发送节流: ChassisTask @100Hz, 每2拍发一次 → 50Hz, 降低CAN负载
+    static uint8_t chassis_fb_send_cnt = 0;
+    if (++chassis_fb_send_cnt >= 2)
+    {
+        chassis_fb_send_cnt = 0;
+        CANCommSend(chasiss_can_comm, (void *)&chassis_feedback_data);
+    }
 #endif // CHASSIS_BOARD
 }

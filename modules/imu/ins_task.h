@@ -74,6 +74,11 @@ typedef struct
  */
 void INS_GetAttitude(float *yaw, float *pitch, float *roll);
 
+/**
+ * @brief 获取三轴角速度（rad/s），供视觉回传 0x12 使用
+ */
+void INS_GetGyro(float *gx, float *gy, float *gz);
+
 
 /* 用于修正安装误差的参数 */
 typedef struct

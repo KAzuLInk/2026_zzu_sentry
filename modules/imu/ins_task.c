@@ -193,6 +193,13 @@ void INS_GetAttitude(float *yaw, float *pitch, float *roll)
     if (roll) *roll = INS.Roll;
 }
 
+void INS_GetGyro(float *gx, float *gy, float *gz)
+{
+    if (gx) *gx = INS.Gyro[X];
+    if (gy) *gy = INS.Gyro[Y];
+    if (gz) *gz = INS.Gyro[Z];
+}
+
 /**
  * @brief          Transform 3dvector from BodyFrame to EarthFrame
  * @param[1]       vector in BodyFrame

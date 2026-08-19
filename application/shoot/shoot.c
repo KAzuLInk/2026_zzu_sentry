@@ -11,9 +11,14 @@
 
 #include "remote_control.h"
 
-#define TORQUE_THRESHOLD  3.0f  // 卡弹扭矩阈值 N·m，实测调
+#define TORQUE_THRESHOLD  6.0f  // 卡弹扭矩阈值 N·m，实测调（太低会误判正常顶弹为卡弹）
 #define REVERSE_SPEED     -5.0f  // 回转速度 rad/s（负=反转）
 #define REVERSE_TIME     500.0f  // 回转持续时间 ms
+
+// 拨盘发弹参数(Ozone可调, 需按机械实测标定)
+volatile float loader_fire_speed = 20.0f;   // 拨盘转速 rad/s
+volatile float single_shot_ms =80.0f;     // 单发一发所需拨盘转动时间 ms（20rad/s实测≈33ms/发, 40ms≈1发留余量）
+volatile float friction_spinup_ms = 150.0f; // 摩擦轮起转到全速时间 ms(两段式延时)
 
 /* 对于双发射机构的机器人,将下面的数据封装成结构体即可,生成两份shoot应用实例 */
 static DJIMotorInstance *friction_l, *friction_r; // 拨盘电机
@@ -34,6 +39,15 @@ static enum {
 }loader_state = LOADER_NORMAL;
 
 static float reverse_start_time = 0;
+
+// 单发状态机: 每次shoot上升沿只拨一发弹丸
+static uint8_t  single_shot_pending = 0;          // 已登记一发, 等摩擦轮起转到位
+static uint8_t  single_shot_active = 0;           // 单发进行中
+static float    single_shot_start = 0;            // 单发起始时间(ms)
+
+// 两段式: 先开摩擦轮, 起转到位后再拨弹
+static uint8_t friction_was_on = 0;               // 上一拍摩擦轮状态(上升沿检测)
+static float   friction_on_start = 0;             // 摩擦轮开启时间(ms)
 
 
 
@@ -153,13 +167,20 @@ void ShootInit()
 
 
     // shoot_pub = PubRegister("shoot_feed", sizeof(Shoot_Upload_Data_s));
-    // shoot_sub = SubRegister("shoot_cmd", sizeof(Shoot_Ctrl_Cmd_s));
+    shoot_sub = SubRegister("shoot_cmd", sizeof(Shoot_Ctrl_Cmd_s));
     // chassis_feed_sub = SubRegister("chassis_feed", sizeof(Chassis_Upload_Data_s));
 }
 
 /* 机器人发射机构控制核心任务 */
 void ShootTask()
 {
+    // 从cmd获取控制数据(robot_cmd已综合视觉shoot + 遥控器拨轮)
+    SubGetMessage(shoot_sub, &shoot_cmd_recv);
+
+    // LOAD_1_BULLET 是单周期事件，先锁存，避免摩擦轮未就绪或卡弹反转时丢失。
+    if (shoot_cmd_recv.load_mode == LOAD_1_BULLET)
+        single_shot_pending = 1;
+
     // ====== 卡弹回转保护 ======
     if (loader_state == LOADER_REVERSING)
     {
@@ -176,18 +197,11 @@ void ShootTask()
         return;
     }
 
-    // ====== 摩擦轮: 拨轮<-400切换开关(边沿触发) ======
-    static uint8_t friction_on = 0;
-    static uint8_t friction_toggle_armed = 1; // 拨轮回弹到>-200后才允许下次切换
-    float dial_raw = rc_data[TEMP].rc.dial;
-
-    if (dial_raw > -200)
-        friction_toggle_armed = 1; // 回弹, 允许下次触发
-    if (dial_raw < -400 && friction_toggle_armed)
-    {
-        friction_on = !friction_on;
-        friction_toggle_armed = 0;
-    }
+    // ====== 摩擦轮: 跟随cmd的friction_mode, 记录起转时间(两段式用) ======
+    uint8_t friction_on = (shoot_cmd_recv.friction_mode == FRICTION_ON);
+    if (friction_on && !friction_was_on) // 上升沿: 记录起转时间
+        friction_on_start = DWT_GetTimeline_ms();
+    friction_was_on = friction_on;
 
     if (friction_on)
     {
@@ -202,15 +216,49 @@ void ShootTask()
         DJIMotorStop(friction_r);
     }
 
-    // ====== 拨盘: 拨轮正值控制速度 ======
-    float dead_zone = 100.0f;
-    float max_speed = 20.0f;
-    float dial_out = 0;
+    // 摩擦轮是否已起转到位(两段式延时)
+    uint8_t friction_ready = friction_on &&
+        (DWT_GetTimeline_ms() - friction_on_start >= friction_spinup_ms);
 
-    if (dial_raw > dead_zone)
-        dial_out = (dial_raw - dead_zone) / (660.0f - dead_zone) * max_speed;
+    // ====== 拨盘: 两段式 — 摩擦轮起转到位后才拨弹 ======
+    // LOAD_1_BULLET  : 单发 — shoot上升沿登记一发, 摩擦轮到位后拨一发
+    // LOAD_BURSTFIRE : 连发 — 持续拨弹(遥控器拨轮手动模式), 同样等摩擦轮到位
+    // 其余(LOAD_STOP): 停止
+    uint8_t loader_run = 0;
 
-    DMMotorSetRef(loader, dial_out);
+    if (friction_on)
+    {
+        if (shoot_cmd_recv.load_mode == LOAD_BURSTFIRE)
+        {
+            loader_run = friction_ready; // 连发持续转(等摩擦轮到位)
+            single_shot_pending = 0;
+            single_shot_active = 0;
+        }
+        else
+        {
+            // 单发请求已经锁存，即使当前命令恢复LOAD_STOP也继续等待摩擦轮。
+            if (single_shot_pending && !single_shot_active && friction_ready)
+            {
+                single_shot_pending = 0;
+                single_shot_active = 1;
+                single_shot_start = DWT_GetTimeline_ms();
+            }
+
+            if (single_shot_active)
+            {
+                if (DWT_GetTimeline_ms() - single_shot_start < single_shot_ms)
+                    loader_run = 1;         // 单发窗口内转动
+                else
+                    single_shot_active = 0; // 时间到, 停止
+            }
+        }
+    }
+    else
+    {
+        single_shot_pending = 0;
+        single_shot_active = 0;
+    }
+    DMMotorSetRef(loader, loader_run ? loader_fire_speed : 0);
 
 
     //双板通信不用sub-pub协议

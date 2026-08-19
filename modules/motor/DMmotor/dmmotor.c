@@ -272,15 +272,21 @@ static void DMMotorDecode(CANInstance *motor_can)
 
     DaemonReload(motor->motor_daemon);
 
+    /* 反馈映射范围必须和电机寄存器 PMAX/VMAX/TMAX 一致。
+     * 不同实例可能使用不同量程，不能固定按模块默认值解析。 */
+    float p_max = motor->p_max > 0.0f ? motor->p_max : DM_P_MAX;
+    float v_max = motor->v_max > 0.0f ? motor->v_max : DM_V_MAX;
+    float t_max = motor->t_max > 0.0f ? motor->t_max : DM_T_MAX;
+
     measure->last_position = measure->position;
     tmp = (uint16_t)((rxbuff[1] << 8) | rxbuff[2]);
-    measure->position = uint_to_float(tmp, DM_P_MIN, DM_P_MAX, 16);
+    measure->position = uint_to_float(tmp, -p_max, p_max, 16);
 
     tmp = (uint16_t)((rxbuff[3] << 4) | rxbuff[4] >> 4);
-    measure->velocity = uint_to_float(tmp, DM_V_MIN, DM_V_MAX, 12);
+    measure->velocity = uint_to_float(tmp, -v_max, v_max, 12);
 
     tmp = (uint16_t)(((rxbuff[4] & 0x0f) << 8) | rxbuff[5]);
-    measure->torque = uint_to_float(tmp, DM_T_MIN, DM_T_MAX, 12);
+    measure->torque = uint_to_float(tmp, -t_max, t_max, 12);
 
     measure->T_Mos = (float)rxbuff[6];
     measure->T_Rotor = (float)rxbuff[7];
@@ -298,6 +304,13 @@ DMMotorInstance *DMMotorInit(Motor_Init_Config_s *config)
 {
     DMMotorInstance *motor = (DMMotorInstance *)malloc(sizeof(DMMotorInstance));
     memset(motor, 0, sizeof(DMMotorInstance));
+
+    /* CAN 注册后反馈中断即可到达，先放入电机默认映射范围，避免首帧按零量程解析。 */
+    motor->p_max = DM_P_MAX;
+    motor->v_max = DM_V_MAX;
+    motor->t_max = DM_T_MAX;
+    motor->kd_max = DM_KD_MAX;
+    motor->kp_max = DM_KP_MAX;
     
     motor->motor_settings = config->controller_setting_init_config;
     PIDInit(&motor->current_PID, &config->controller_param_init_config.current_PID);
@@ -318,12 +331,6 @@ DMMotorInstance *DMMotorInit(Motor_Init_Config_s *config)
     motor->motor_daemon = DaemonRegister(&conf);
 
     DMMotorEnable(motor);
-    motor ->p_max = 12.5f;
-    motor ->v_max = 200.0f;
-    motor ->t_max =10.0f;
-    motor->kd_max = 5.0f;
-    motor->kp_max = 5.0f;
-
     // 不在 Init 阶段发使能命令——会使电机进入 MIT 模式，但此时还没有任务发控制帧，
     // 电机看门狗超时（~20ms）后会进入 FAULT 状态，导致后续 Task 里的 0xFC 被拒绝。
     // 使能和归零统一在 DMMotorTask 开头发送，紧跟 MIT 控制帧，消除空窗期。

@@ -69,10 +69,11 @@ uint16_t get_protocol_info(uint8_t *rx_buf,			 // 接收到的原始数据
 uint16_t seasky_send(uint8_t msg_id, const uint8_t *payload, uint16_t payload_len,
 					 uint8_t *tx_buf);
 
-/* V1 解帧：在 rx_buf(长度 rx_len) 中搜索并校验一帧，
- * msg_id 匹配时拷贝 payload 并返回 payload 长度（>=0）；
- * 未收到完整/匹配帧返回 -1，CRC 错误的假帧头被跳过。 */
-int16_t seasky_recv(uint8_t msg_id, const uint8_t *rx_buf, uint16_t rx_len,
-					uint8_t *payload, uint16_t *payload_len);
+/* V1 解帧（消费式，处理粘包/半包）：在 rx_buf 中弹出并校验一帧。
+ * 成功后从缓冲区删除该帧（前移剩余数据）、拷贝 payload，返回 msg_id(>0)；
+ * 尚无完整帧时返回 -1（半帧原样保留，等下次补数）；
+ * 假帧头（长度非法 / CRC 错）逐字节丢弃继续搜。 */
+int16_t seasky_pop_frame(uint8_t *rx_buf, uint16_t *rx_len,
+						 uint8_t *payload, uint16_t *payload_len);
 
 #endif

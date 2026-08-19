@@ -270,13 +270,18 @@ static int8_t CDC_Control_HS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_HS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 11 */
-  //将收到len字节数据拷进缓冲区
+  /*
+   * 先解析当前缓冲区，再重新挂载下一次接收。
+   * 如果先调用 USBD_CDC_ReceivePacket()，主机可能在协议解析完成前
+   * 复用同一块 UserRxBufferHS，连续的 0x02/0x03 帧会有被覆盖的风险。
+   */
+  if (usb_rx_callback != NULL) {
+    usb_rx_callback((uint16_t)*Len);
+  }
+
+  // 当前帧处理完成后，重新开放下一次 USB OUT 接收
   USBD_CDC_SetRxBuffer(&hUsbDeviceHS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceHS);
-  // 收到数据 → 指针指向数据
-  if (usb_rx_callback != NULL) {
-    usb_rx_callback(*Len);  
-  }
   return (USBD_OK);
   /* USER CODE END 11 */
 }

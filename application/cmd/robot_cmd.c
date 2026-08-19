@@ -4,6 +4,7 @@
 // module
 #include "remote_control.h"
 #include "ins_task.h"
+#include "gimbal.h"
 #include "master_process.h"
 #include "message_center.h"
 #include "general_def.h"
@@ -58,6 +59,9 @@ static INS_t INS_CMD;
 static uint8_t flag = 1;
 static float aligned_total_yaw, aligned_total_pitch, delayed_total_yaw, fitter_vision_recv_data_yaw;
 static float send_first, send_first_pitch, send_second;
+
+// 视觉开火请求：收到0x03后先锁存，云台进入±5°窗口后再触发一次拨弹
+static uint8_t vision_shot_pending = 0;
 
 // ====================== 新增：热量管控参数 ======================
 #define HEAT_PER_BULLET 10.0f    // 每发子弹增加热量
@@ -178,6 +182,10 @@ static void RemoteControlSet()
     shoot_cmd_send.friction_mode = FRICTION_OFF;
     shoot_cmd_send.load_mode = LOAD_STOP;
 
+    // 离开视觉模式时丢弃尚未执行的视觉开火请求，避免切换模式后误发
+    if (!switch_is_mid(rc_data[TEMP].rc.switch_right))
+        vision_shot_pending = 0;
+
     // 控制底盘和云台运行模式,云台待添加,云台是否始终使用IMU数据?
     gimbal_cmd_send.gimbal_mode = GIMBAL_GYRO_MODE;
     // rc_data[TEMP].rc.switch_left = 3;
@@ -235,7 +243,7 @@ static void RemoteControlSet()
 
     //我说实话，自瞄和导航和电控关系不大，你们压力视觉就行，而且注意机械结构有问题直接压力机械组
     
-    if (switch_is_mid(rc_data[TEMP].rc.switch_left) || game_start_flag) // 左侧开关状态[中],自瞄模式 && (vision_recv_data->yaw || vision_recv_data->pitch)
+    if (switch_is_mid(rc_data[TEMP].rc.switch_right)) // 右侧开关状态[中],自瞄模式(与gimbal的右中视觉模式同步)
     {
         if (vision_recv_data == NULL)
         {
@@ -243,7 +251,7 @@ static void RemoteControlSet()
         }
         //  视觉会发来目标的绝对位置
         // ...
-        shoot_cmd_send.friction_mode = FRICTION_ON; // 自瞄控制发弹
+        // 摩擦轮开关移到下面跟 shoot 联动, 不再无条件开启
 
         if (vision_recv_data->yaw < 190 &&
             vision_recv_data->pitch < 40 &&
@@ -257,13 +265,35 @@ static void RemoteControlSet()
 
             gimbal_cmd_send.gimbal_mode = GIMBAL_GYRO_MODE;
 
+            // 拨盘: fire=1先锁存，待云台yaw/pitch均进入目标±5°后再触发。
             if (vision_recv_data->shoot == 1)
             {
-                shoot_cmd_send.load_mode = LOAD_BURSTFIRE;
+                vision_shot_pending = 1;
+                vision_recv_data->shoot = 0; // 消费本次开火脉冲
             }
-            else if (vision_recv_data->shoot == 0)
+
+            if (vision_shot_pending)
             {
-                shoot_cmd_send.load_mode = LOAD_STOP;
+                if (vision_recv_data->target_state != READY_TO_FIRE || !VisionIsOnline())
+                {
+                    // 锁敌丢失时取消旧开火请求，必须由视觉重新发起
+                    vision_shot_pending = 0;
+                }
+                else if (GimbalVisionTargetAligned(5.0f))
+                {
+                    shoot_cmd_send.load_mode = LOAD_1_BULLET;
+                    vision_shot_pending = 0;
+                }
+            }
+
+            // 摩擦轮: 跟锁敌标志(锁敌才开, 否则关), 与 fire 脉冲解耦, 避免每周期闪断
+            if (vision_recv_data->target_state == READY_TO_FIRE)
+            {
+                shoot_cmd_send.friction_mode = FRICTION_ON;
+            }
+            else
+            {
+                shoot_cmd_send.friction_mode = FRICTION_OFF;
             }
         }
 
@@ -271,13 +301,19 @@ static void RemoteControlSet()
 
         chassis_cmd_send.vy = vision_recv_data->vy * 19500; // 水平方向
         chassis_cmd_send.vx = vision_recv_data->vx * 19500; // 竖直方向
-        chassis_cmd_send.wz = vision_recv_data->wz;
 
-        chassis_cmd_send.wz = vision_recv_data->spin * 10.0f; // 和视觉一致他们要发spin,10是历史残留具体值，具体视觉发多少看chassis.c
-
-        if (chassis_cmd_send.wz != 0)
+        // 小陀螺：spin=1 用固定转速(Vz 无意义)；spin=0 用视觉 vz 当底盘 wz 并允许全向平移
+        if (vision_recv_data->spin != 0)
         {
+            chassis_cmd_send.wz = 1000.0f;
             chassis_cmd_send.chassis_mode = CHASSIS_ROTATE;
+        }
+        else
+        {
+            chassis_cmd_send.wz = vision_recv_data->wz; // 协议 vz -> 底盘转速 wz
+            // vz 非零 → ROTATE 让底盘按 vz 旋转；vz==0 → NO_FOLLOW 全向平移不旋转
+            // （NO_FOLLOW 在底盘板会把 wz 强制清零，所以有转速时必须走 ROTATE）
+            chassis_cmd_send.chassis_mode = (vision_recv_data->wz != 0) ? CHASSIS_ROTATE : CHASSIS_NO_FOLLOW;
         }
     }
 
@@ -303,7 +339,7 @@ static void RemoteControlSet()
         }
     }
 
-    if (!switch_is_mid(rc_data[TEMP].rc.switch_left))
+    if (!switch_is_mid(rc_data[TEMP].rc.switch_right) && !switch_is_mid(rc_data[TEMP].rc.switch_left))
     {
         if (rc_data[TEMP].rc.dial < -100 && rc_data[TEMP].rc.dial > -175)
         {
@@ -545,14 +581,59 @@ void RobotCMDTask()
 
     INS_GetAttitude(&INS_CMD.Yaw, &INS_CMD.Pitch, &INS_CMD.Roll); // 原本这个函数获取在INS.C中的INS值，
 
-    VisionSetAltitude(INS_CMD.Yaw,
-                      INS_CMD.Pitch,
-                      INS_CMD.Roll); //
+    // 0x12 yaw/pitch/roll 全部用云台板 IMU 姿态
+    VisionSetAltitude(INS_CMD.Yaw, INS_CMD.Pitch, INS_CMD.Roll);
 
-    VisionSetBattery(24000, 0, 0); // 电池电压 24V 标称值占位，电流/电量待接超级电容后补真实值
+    // IMU 角速度 0x12（rad/s，与视觉侧 imu_gyro_deg=false 一致）；欧拉角已由 VisionSetAltitude 设置
+    {
+        float gx, gy, gz;
+        INS_GetGyro(&gx, &gy, &gz);
+        VisionSetGyro(gx, gy, gz);
+    }
+
+    // 0x12 末尾小云台：小yaw相对中心偏转角(度) + pitch电机位置(度)
+    VisionSetSmallYawPitch(GimbalGetSmallYawPosition(),
+                           GimbalGetPitchPosition() * RAD_2_DEGREE);
+
+#ifdef GIMBAL_BOARD
+    // 0x12 末尾底盘板 IMU：经 CANComm 从底盘板回传
+    VisionSetChassisIMU(chassis_fetch_data.chassis_yaw,
+                        chassis_fetch_data.chassis_pitch,
+                        chassis_fetch_data.chassis_roll,
+                        chassis_fetch_data.chassis_gyro_x,
+                        chassis_fetch_data.chassis_gyro_y,
+                        chassis_fetch_data.chassis_gyro_z);
+#endif
+
+    VisionSetBattery(24000,                                  // 电压(mV): 24V 标称(哨兵 6S)，云台板无电压采样
+                     chassis_fetch_data.chassis_cap_current, // 电流(mA): 底盘超级电容实测电流
+                     0);                                     // 电量(%): 暂无来源
     VisionSetStatus(Referee_ToVision_data.game_progress,
                     Referee_ToVision_data.life,
                     0);
+
+    // 云台电机反馈 0x11（DM4310 实测：转速 rad/s×100, 位置 mrad, 力矩 mNm）
+    {
+        int16_t gb_speed[GIMBAL_MOTOR_COUNT];
+        int32_t gb_pos[GIMBAL_MOTOR_COUNT];
+        int16_t gb_cur[GIMBAL_MOTOR_COUNT];
+        GimbalGetMotorFeedback(gb_speed, gb_pos, gb_cur);
+        VisionSetGimbalMotors(gb_speed, gb_pos, gb_cur);
+    }
+
+    // 底盘电机反馈 0x10（来自底盘板 CAN：转速 rpm, 编码器累计脉冲, 电流 mA）
+    {
+        int16_t ch_speed[CHASSIS_MOTOR_COUNT];
+        int32_t ch_pos[CHASSIS_MOTOR_COUNT];
+        int16_t ch_cur[CHASSIS_MOTOR_COUNT];
+        for (uint8_t i = 0; i < CHASSIS_MOTOR_COUNT; i++)
+        {
+            ch_speed[i] = (int16_t)chassis_fetch_data.motor_speed[i];   // rpm
+            ch_pos[i]   = chassis_fetch_data.motor_position[i];         // 脉冲数
+            ch_cur[i]   = (int16_t)chassis_fetch_data.motor_current[i]; // mA
+        }
+        VisionSetChassisMotors(ch_speed, ch_pos, ch_cur);
+    }
 
     Vision_Send_All(); // DMA连续发会堵塞，写了一个状态机来在两个周期分别发
 

@@ -4,9 +4,8 @@
 #include "bsp_usart.h"
 #include "seasky_protocol.h"
 
-#define VISION_RECV_SIZE 36u // 原来是18.可以正常接收yaw和pitch,现在改成36测试接收第三个数据shoot。
 #define Nav_RECV_SIZE 22u
-#define VISION_SEND_SIZE 42u
+#define VISION_SEND_SIZE 64u // IMU 帧总长 6+56=62B
 #define CHASSIS_MOTOR_COUNT 4 // 底盘电机数量
 #define GIMBAL_MOTOR_COUNT 2  // 云台电机数量(yaw, pitch)
 
@@ -147,15 +146,23 @@ typedef struct
     Vision_Send_motor motors[GIMBAL_MOTOR_COUNT];
 } Vision_Gimbal_Motors_s;
 
-/* IMU 数据，msg_id=0x12，payload=24B */
+/* IMU 数据，msg_id=0x12，payload=56B（14×float） */
 typedef struct
 {
-    float yaw;
-    float pitch;
-    float roll;
-    float gyro_x;
-    float gyro_y;
-    float gyro_z;
+    float yaw;            // 大云台 IMU 偏航角(度)
+    float pitch;          // 大云台 IMU 俯仰角(度)
+    float roll;           // 大云台 IMU 横滚角(度)
+    float gyro_x;         // 大云台 X 轴角速度(rad/s)
+    float gyro_y;         // 大云台 Y 轴角速度(rad/s)
+    float gyro_z;         // 大云台 Z 轴角速度(rad/s)
+    float small_yaw;      // 小云台偏航角(度)
+    float small_pitch;    // 小云台俯仰角(度)
+    float chassis_yaw;    // 底盘 IMU 偏航角(度)
+    float chassis_pitch;  // 底盘 IMU 俯仰角(度)
+    float chassis_roll;   // 底盘 IMU 横滚角(度)
+    float chassis_gyro_x; // 底盘 IMU X 轴角速度(rad/s)
+    float chassis_gyro_y; // 底盘 IMU Y 轴角速度(rad/s)
+    float chassis_gyro_z; // 底盘 IMU Z 轴角速度(rad/s)
 } Vision_IMU_Send_s;
 
 /* ==================== 下行接收结构（上位机 -> 电控） ==================== */
@@ -163,13 +170,13 @@ typedef struct
 /* 综合控制 fix_control，msg_id=0x05，payload=22B */
 typedef struct
 {
-    uint8_t flags; // bit0=锁敌
+    uint8_t flags; // bit0=锁敌 bit1=小陀螺开关
     float yaw;
     float pitch;
     uint8_t fire;  // 0/1 开火
     float vx;
     float vy;
-    float vz;      // 与视觉组约定：复用为 spin（小陀螺旋转角速度）
+    float vz;      // 底盘旋转角速度，接收后存入 recv_data.wz
 } Vision_Fix_Ctrl_s;
 #pragma pack()
 
@@ -177,6 +184,16 @@ typedef struct
  * @brief 调用此函数初始化视觉的 USB 虚拟串口通信（VCP）
  */
 Vision_Recv_s *VisionInit(void);
+
+/**
+ * @brief 获取视觉接收数据指针（不重复初始化 USB/daemon，供云台等其它模块直接读取）
+ */
+Vision_Recv_s *VisionGetRecv(void);
+
+/**
+ * @brief 视觉通信是否在线（VCP daemon 状态）
+ */
+uint8_t VisionIsOnline(void);
 
 /**
  * @brief 设置上行 IMU 姿态数据（电控 -> 上位机）
@@ -197,14 +214,21 @@ void VisionSetStatus(uint8_t mode, uint16_t hp, uint8_t error);
 void VisionSetChassisMotors(int16_t *speed, int32_t *pos, int16_t *cur);
 void VisionSetGimbalMotors(int16_t *speed, int32_t *pos, int16_t *cur);
 void VisionSetIMU(float yaw, float pitch, float roll, float gx, float gy, float gz);
+/* 只设置三轴角速度（rad/s），欧拉角仍由 VisionSetAltitude 设置 */
+void VisionSetGyro(float gx, float gy, float gz);
+/* 设置小yaw/pitch（0x12 末尾两字段，单位均为度） */
+void VisionSetSmallYawPitch(float small_yaw, float small_pitch);
+/* 设置底盘板 IMU（0x12 末尾 6 字段：姿态为度，角速度为 rad/s） */
+void VisionSetChassisIMU(float yaw, float pitch, float roll, float gx, float gy, float gz);
 
 /* ====================== 上行反馈发送函数 ====================== */
 void VisionSendChassis(void);  // msg_id=0x10
 void VisionSendGimbal(void);   // msg_id=0x11
-void VisionSendIMU(void);      // msg_id=0x12
-void VisionSendBattery(void);  // msg_id=0x13
-void VisionSendStatus(void);   // msg_id=0x14
-void Vision_Send_All(void);    // 状态机轮流发送
+void VisionSendIMU(void);           // msg_id=0x12
+void VisionSendBattery(void);       // msg_id=0x13
+void VisionSendStatus(void);        // msg_id=0x14
+void VisionSendHeartbeatAck(void);  // msg_id=0x1F（空负载，收到 0x0F 心跳后回）
+void Vision_Send_All(void);         // 状态机轮流发送
 
 
 #endif // !MASTER_PROCESS_H

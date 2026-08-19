@@ -17,7 +17,7 @@
 
 /* 开发板类型定义,烧录时注意不要弄错对应功能;修改定义后需要重新编译,只能存在一个定义! */
 // #define ONE_BOARD // 单板控制整车
-//#define CHASSIS_BOARD //底盘板
+// #define CHASSIS_BOARD //底盘板
  #define GIMBAL_BOARD // 云台板
 
 #define VISION_USE_VCP // 使用虚拟串口发送视觉数据
@@ -189,8 +189,14 @@ typedef struct
 
 typedef struct
 {
-#if defined(CHASSIS_BOARD) || defined(GIMBAL_BOARD) // 非单板的时候底盘还将imu数据回传(若有必要)
-    // attitude_t chassis_imu_data;
+#if defined(CHASSIS_BOARD) || defined(GIMBAL_BOARD) // 非单板的时候底盘将imu数据回传(经CANComm, 由0x12转发)
+    // 底盘板 IMU：姿态(度) + 三轴角速度(rad/s)
+    float chassis_yaw;
+    float chassis_pitch;
+    float chassis_roll;
+    float chassis_gyro_x;
+    float chassis_gyro_y;
+    float chassis_gyro_z;
 #endif
     // 后续增加底盘的真实速度
     // float real_vx;
@@ -199,6 +205,7 @@ typedef struct
     float rest_heat;           // 剩余枪口热量
     float motor_speed[HUBS_NUMBER]; // 电机速度
     float motor_current[HUBS_NUMBER]; // 电机电流
+    int32_t motor_position[HUBS_NUMBER]; // 电机编码器累计位置（脉冲数, total_round*8192+ecd）
     uint8_t chassis_level;
     uint16_t chassis_power_limit;
     uint16_t chassis_power;

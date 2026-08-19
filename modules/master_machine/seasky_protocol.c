@@ -162,50 +162,60 @@ uint16_t seasky_send(uint8_t msg_id, const uint8_t *payload, uint16_t payload_le
     return 6 + payload_len; /* 帧总长 */
 }
 
-int16_t seasky_recv(uint8_t msg_id, const uint8_t *rx_buf, uint16_t rx_len,
-                    uint8_t *payload, uint16_t *payload_len)
+int16_t seasky_pop_frame(uint8_t *rx_buf, uint16_t *rx_len,
+                         uint8_t *payload, uint16_t *payload_len)
 {
-    uint16_t i = 0;
+    uint16_t n = *rx_len;
     uint16_t len;
     uint16_t crc_calc, crc_recv;
+    uint16_t frame_len;
+    int16_t msg_id;
 
-    while (i + 6 <= rx_len) /* 最小帧为 6 字节 */
+    while (n >= 6) /* 最小帧为 6 字节 */
     {
-        if (rx_buf[i] != PROTOCOL_CMD_ID) /* 找帧头 */
+        if (rx_buf[0] != PROTOCOL_CMD_ID) /* 垃圾字节，丢弃 */
         {
-            i++;
+            memmove(rx_buf, rx_buf + 1, n - 1);
+            n--;
             continue;
         }
 
-        len = rx_buf[i + 1] | ((uint16_t)rx_buf[i + 2] << 8);
+        len = rx_buf[1] | ((uint16_t)rx_buf[2] << 8);
 
-        if (len > SEASKY_MAX_PAYLOAD_LEN) /* 异常长度：按假帧头跳过，防止 payload 越界 */
+        if (len > SEASKY_MAX_PAYLOAD_LEN) /* 异常长度：按假帧头丢弃，防止越界 */
         {
-            i++;
+            memmove(rx_buf, rx_buf + 1, n - 1);
+            n--;
             continue;
         }
 
-        if (i + 6 + len > rx_len) /* 半帧：等下次补数 */
-            return -1;
+        frame_len = 6 + len;
+        if (frame_len > n) /* 半帧：原样保留，等下次补数 */
+            break;
 
-        crc_calc = crc_modbus(&rx_buf[i], 4 + len);
-        crc_recv = rx_buf[i + 4 + len] | ((uint16_t)rx_buf[i + 4 + len + 1] << 8);
-        if (crc_calc != crc_recv) /* 假帧头，跳过继续搜 */
+        crc_calc = crc_modbus(rx_buf, 4 + len);
+        crc_recv = rx_buf[4 + len] | ((uint16_t)rx_buf[4 + len + 1] << 8);
+        if (crc_calc != crc_recv) /* 假帧头（CRC 错），丢弃帧头字节 */
         {
-            i++;
+            memmove(rx_buf, rx_buf + 1, n - 1);
+            n--;
             continue;
         }
 
-        if (rx_buf[i + 3] == msg_id) /* 匹配：提取 payload */
-        {
-            if (payload != NULL && len > 0)
-                memcpy(payload, &rx_buf[i + 4], len);
-            if (payload_len != NULL)
-                *payload_len = len;
-            return (int16_t)len;
-        }
+        /* 合法帧：提取 msg_id + payload，整帧消费（前移剩余数据） */
+        msg_id = (int16_t)rx_buf[3];
+        if (payload != NULL && len > 0)
+            memcpy(payload, &rx_buf[4], len);
+        if (payload_len != NULL)
+            *payload_len = len;
 
-        i += 6 + len; /* 合法帧但 id 不匹配：整帧跳过 */
+        n -= frame_len;
+        if (n > 0)
+            memmove(rx_buf, rx_buf + frame_len, n);
+        *rx_len = n;
+        return msg_id;
     }
+
+    *rx_len = n;
     return -1;
 }

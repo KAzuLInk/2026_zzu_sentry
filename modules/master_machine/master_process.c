@@ -22,13 +22,12 @@ static Vision_Status_Send_s send_status;
 
 /**
  * @brief 设置上行 IMU 姿态数据（电控 -> 上位机）
- * @attention 与旧实现保持一致：pitch/roll 交换（历史轴系约定）
  */
 void VisionSetAltitude(float yaw, float pitch, float roll)
 {
     send_imu.yaw = yaw;
-    send_imu.pitch = roll;
-    send_imu.roll = pitch;
+    send_imu.pitch = pitch;
+    send_imu.roll = roll;
 }
 
 /**
@@ -51,12 +50,25 @@ void VisionSetStatus(uint8_t mode, uint16_t hp, uint8_t error)
     send_status.error = error;
 }
 
+/**
+ * @brief 获取视觉接收数据指针（不重复初始化 USB/daemon，供云台等其它模块直接读取）
+ */
+Vision_Recv_s *VisionGetRecv(void)
+{
+    return &recv_data;
+}
+
 #ifdef VISION_USE_VCP
 
 #include "bsp_usb.h"
 
-static uint8_t *vis_recv_buff;
+#define VISION_RX_BUF_SIZE 1024u /* 跨包累计缓冲，需 ≥ USB 单包(512B) + 最大帧(6+128B) */
+
+static uint8_t *vis_recv_buff;          /* 指向 USB CDC 每包接收缓冲（每包被覆盖） */
+static uint8_t vis_rx_buf[VISION_RX_BUF_SIZE]; /* 跨 USB 包累计的接收缓冲 */
+static uint16_t vis_rx_len;             /* vis_rx_buf 中有效字节数 */
 static DaemonInstance *vision_daemon_instance;
+static volatile uint8_t heartbeat_ack_pending; /* 收到 0x0F 心跳后置位，任务上下文回 0x1F */
 
 /**
  * @brief 离线回调函数，VCP 模式下仅记录警告，USB 栈自行处理重连
@@ -64,47 +76,99 @@ static DaemonInstance *vision_daemon_instance;
 static void VisionOfflineCallback(void *id)
 {
     UNUSED(id);
+    /* 视觉断连：清零所有视觉来源的控制量，防止车保持最后一帧速度 / 继续开火 / 小陀螺空转 */
+    recv_data.vx    = 0;
+    recv_data.vy    = 0;
+    recv_data.wz    = 0;
+    recv_data.yaw   = 0.0f;
+    recv_data.pitch = 0.0f;
+    recv_data.shoot = 0;
+    recv_data.spin  = 0.0f;
+    recv_data.target_state = NO_TARGET;
     LOGWARNING("[vision] vision offline via VCP, check USB connection.");
 }
 
 /**
  * @brief 接收解包回调，由 USB CDC 接收中断调用（CDC_Receive_HS -> usb_rx_callback）
- *        解析上位机下发的控制帧，写入 recv_data。
+ *        先把本包数据追加到跨包累计缓冲，再循环弹出完整帧写入 recv_data，
+ *        以正确处理 USB 粘包/半包（单帧拆成多包、多帧并进一包）。
  */
 static void DecodeVision(uint16_t recv_len)
 {
     static uint8_t payload[SEASKY_MAX_PAYLOAD_LEN];
     uint16_t len = 0;
-    Vision_Fix_Ctrl_s fix;
+    int16_t msg_id;
 
-    // 综合控制 0x05：flags + yaw + pitch + fire + vx + vy + vz（22B）
-    if (seasky_recv(MSG_ID_FIX_CTRL, vis_recv_buff, recv_len, payload, &len) >= 0 &&
-        len >= sizeof(Vision_Fix_Ctrl_s))
+    /* 追加新收到的数据到累计缓冲，并做溢出保护 */
+    if (recv_len > 0 && vis_recv_buff != NULL)
     {
-        memcpy(&fix, payload, sizeof(Vision_Fix_Ctrl_s));
-        recv_data.yaw   = fix.yaw;
-        recv_data.pitch = fix.pitch;
-        recv_data.shoot = fix.fire;
-        recv_data.vx    = fix.vx;
-        recv_data.vy    = fix.vy;
-        recv_data.spin  = fix.vz; // 与视觉组约定：vz 复用为 spin（小陀螺旋转角速度），视觉组需在此填 spin 而非 0
-        recv_data.target_state = (fix.flags & 0x01) ? READY_TO_FIRE : NO_TARGET;
-        DaemonReload(vision_daemon_instance);
-        return;
+        if (recv_len >= VISION_RX_BUF_SIZE) /* 单包异常过大（理论 ≤512B）：整缓冲丢弃 */
+        {
+            vis_rx_len = 0;
+        }
+        else if (vis_rx_len + recv_len > VISION_RX_BUF_SIZE)
+        {
+            /* 溢出：丢弃最旧一半，保留尾部（半帧优先保留） */
+            uint16_t keep = vis_rx_len / 2;
+            memmove(vis_rx_buf, vis_rx_buf + keep, vis_rx_len - keep);
+            vis_rx_len -= keep;
+        }
+        memcpy(&vis_rx_buf[vis_rx_len], vis_recv_buff, recv_len);
+        vis_rx_len += recv_len;
     }
 
-    // 云台控制 0x02：flags + yaw + pitch（9B）
-    if (seasky_recv(MSG_ID_GIMBAL_CTRL, vis_recv_buff, recv_len, payload, &len) >= 0 &&
-        len >= 9)
+    /* 循环解出所有完整帧，半帧留在缓冲里等下次补数 */
+    while ((msg_id = seasky_pop_frame(vis_rx_buf, &vis_rx_len, payload, &len)) > 0)
     {
-        recv_data.target_state = (payload[0] & 0x01) ? READY_TO_FIRE : NO_TARGET;
-        memcpy(&recv_data.yaw,   &payload[1], 4);
-        memcpy(&recv_data.pitch, &payload[5], 4);
-        DaemonReload(vision_daemon_instance);
-        return;
+        Vision_Fix_Ctrl_s fix;
+
+        // 综合控制 0x05：flags + yaw + pitch + fire + vx + vy + vz（22B）
+        if (msg_id == MSG_ID_FIX_CTRL && len >= sizeof(Vision_Fix_Ctrl_s))
+        {
+            memcpy(&fix, payload, sizeof(Vision_Fix_Ctrl_s));
+            recv_data.yaw   = fix.yaw;
+            recv_data.pitch = fix.pitch;
+            recv_data.shoot = fix.fire;
+            recv_data.vx    = fix.vx;
+            recv_data.vy    = fix.vy;
+            recv_data.wz    = fix.vz * 57.295779513f; // 协议 vz(rad/s) -> 底盘转速 wz(°/s)
+            recv_data.spin  = (fix.flags & 0x02) ? 1.0f : 0.0f; // bit1 = 小陀螺开关
+            recv_data.target_state = (fix.flags & 0x01) ? READY_TO_FIRE : NO_TARGET;
+            DaemonReload(vision_daemon_instance);
+        }
+        // 底盘控制 0x01：flags + vx + vy + vw（13B），vw 同为 rad/s
+        else if (msg_id == MSG_ID_CHASSIS_CTRL && len >= 13)
+        {
+            memcpy(&recv_data.vx, &payload[1], 4);
+            memcpy(&recv_data.vy, &payload[5], 4);
+            memcpy(&recv_data.wz, &payload[9], 4);
+            recv_data.wz  *= 57.295779513f; // rad/s -> °/s
+            recv_data.spin = (payload[0] & 0x02) ? 1.0f : 0.0f; // bit1 = 小陀螺开关
+            DaemonReload(vision_daemon_instance);
+        }
+        // 发射控制 0x03：fire_mode + fire_speed + bullet_type（6B）
+        else if (msg_id == MSG_ID_SHOOT_CTRL && len >= 6)
+        {
+            recv_data.shoot = (payload[0] >= 1) ? 1 : 0; // fire_mode: 0=停,1=单发,2=连发 → 非 0 即开火
+            DaemonReload(vision_daemon_instance);
+        }
+        // 云台控制 0x02：flags + yaw + pitch（9B）
+        else if (msg_id == MSG_ID_GIMBAL_CTRL && len >= 9)
+        {
+            recv_data.target_state = (payload[0] & 0x01) ? READY_TO_FIRE : NO_TARGET;
+            memcpy(&recv_data.yaw,   &payload[1], 4);
+            memcpy(&recv_data.pitch, &payload[5], 4);
+            DaemonReload(vision_daemon_instance);
+        }
+        // 心跳包 0x0F：空负载，刷新在线状态并置位回包标志（回包在任务上下文发送）
+        else if (msg_id == MSG_ID_HEARTBEAT)
+        {
+            heartbeat_ack_pending = 1;
+            DaemonReload(vision_daemon_instance);
+        }
+        /* 其余未用 msg_id 已由 pop 消费，直接丢弃 */
     }
 }
-
 /**
  * @brief 初始化视觉 VCP 通信
  */
@@ -122,6 +186,14 @@ Vision_Recv_s *VisionInit(void)
     vision_daemon_instance = DaemonRegister(&daemon_conf);
 
     return &recv_data;
+}
+
+/**
+ * @brief 视觉通信是否在线（VCP daemon 状态）
+ */
+uint8_t VisionIsOnline(void)
+{
+    return DaemonIsOnline(vision_daemon_instance);
 }
 
 /* ====================== 上行反馈设置函数（电控 -> 上位机） ====================== */
@@ -156,6 +228,29 @@ void VisionSetIMU(float yaw, float pitch, float roll, float gx, float gy, float 
     send_imu.gyro_z = gz;
 }
 
+void VisionSetGyro(float gx, float gy, float gz)
+{
+    send_imu.gyro_x = gx;
+    send_imu.gyro_y = gy;
+    send_imu.gyro_z = gz;
+}
+
+void VisionSetSmallYawPitch(float small_yaw, float small_pitch)
+{
+    send_imu.small_yaw = small_yaw;
+    send_imu.small_pitch = small_pitch;
+}
+
+void VisionSetChassisIMU(float yaw, float pitch, float roll, float gx, float gy, float gz)
+{
+    send_imu.chassis_yaw    = yaw;
+    send_imu.chassis_pitch  = pitch;
+    send_imu.chassis_roll   = roll;
+    send_imu.chassis_gyro_x = gx;
+    send_imu.chassis_gyro_y = gy;
+    send_imu.chassis_gyro_z = gz;
+}
+
 /* ====================== 上行反馈发送函数 ====================== */
 
 /**
@@ -168,7 +263,6 @@ void VisionSendChassis(void)
                                   sizeof(send_chassis_motors), send_buf);
     USBTransmit(send_buf, tx_len);
 }
-
 /**
  * @brief 发送云台电机反馈 msg_id=0x11，payload=16B
  */
@@ -181,7 +275,7 @@ void VisionSendGimbal(void)
 }
 
 /**
- * @brief 发送 IMU 数据 msg_id=0x12，payload=24B
+ * @brief 发送 IMU 数据 msg_id=0x12，payload=56B
  */
 void VisionSendIMU(void)
 {
@@ -214,27 +308,52 @@ void VisionSendStatus(void)
 }
 
 /**
- * @brief 综合发送状态机：轮流发送 IMU / 电池 / 状态数据，避免 DMA 连续发送堵塞。
+ * @brief 发送心跳响应 msg_id=0x1F，payload=0B（空负载）
+ */
+void VisionSendHeartbeatAck(void)
+{
+    static uint8_t send_buf[VISION_SEND_SIZE];
+    uint16_t tx_len = seasky_send(MSG_ID_HEARTBEAT_ACK, NULL, 0, send_buf);
+    USBTransmit(send_buf, tx_len);
+}
+
+/**
+ * @brief 综合发送状态机：轮流发送 IMU / 电池 / 状态 / 底盘 / 云台数据，避免 DMA 连续发送堵塞。
  *        调用频率 100Hz（RobotCMDTask 周期 10ms），10 个相位 = 100ms 一轮：
- *        电池 @ 10Hz，状态 @ 10Hz，IMU @ 80Hz。
+ *        电池 @ 10Hz，状态 @ 10Hz，底盘 @ 10Hz，云台 @ 10Hz，IMU @ 60Hz。
+ *        收到 0x0F 心跳后在本函数顶部立即回 0x1F（不占相位）。
  */
 void Vision_Send_All(void)
 {
     static uint8_t phase = 0;
+
+    /* 收到上位机心跳 0x0F → 立即回 0x1F，证明电控在线（不走相位机，保证及时） */
+    if (heartbeat_ack_pending)
+    {
+        heartbeat_ack_pending = 0;
+        VisionSendHeartbeatAck();
+    }
+
     phase++;
     if (phase >= 10) phase = 0;
 
-    if (phase == 0)
+    switch (phase)
     {
+    case 0:
         VisionSendBattery(); // 电池信息 @ 10Hz
-    }
-    else if (phase == 1)
-    {
+        break;
+    case 1:
         VisionSendStatus();  // 机器人状态 @ 10Hz
-    }
-    else
-    {
-        VisionSendIMU();     // IMU @ 80Hz
+        break;
+    case 2:
+        VisionSendChassis(); // 底盘电机反馈 @ 10Hz
+        break;
+    case 3:
+        VisionSendGimbal();  // 云台电机反馈 @ 10Hz
+        break;
+    default:
+        VisionSendIMU();     // IMU @ 60Hz
+        break;
     }
 }
 
