@@ -11,6 +11,7 @@
 #include "dji_motor.h"
 #include "buffer.h"
 #include "referee_task.h"
+#include <string.h>
 
 // bsp
 #include "bsp_dwt.h"
@@ -20,11 +21,15 @@
 // @todo 8191转换成360的精度太低,会损失精度
 #define YAW_ALIGN_ANGLE (YAW_CHASSIS_ALIGN_ECD * ECD_ANGLE_COEF_DJI) // 对齐时的角度,0-360
 #define PTICH_HORIZON_ANGLE (PITCH_HORIZON_ECD * ECD_ANGLE_COEF_DJI) // pitch水平时电机的角度,0-360
+#define CHASSIS_GYRO_TIMEOUT_MS 50.0f // 独立角速度丢失后切回完整底盘反馈
 
 /* cmd应用包含的模块实例指针和交互信息存储*/
 #ifdef GIMBAL_BOARD // 对双板的兼容,条件编译
 #include "can_comm.h"
 static CANCommInstance *cmd_can_comm; // 双板通信
+static volatile float chassis_gyro_z;                 // 0x313接收值，rad/s
+static volatile float chassis_gyro_rx_timestamp_ms;   // 最近有效报文时间
+static volatile uint8_t chassis_gyro_received;        // 至少收到过一帧有效数据
 #endif
 #if defined(ONE_BOARD) || defined(GIMBAL_BOARD)
 static Publisher_t *chassis_cmd_pub;   // 底盘控制消息发布者
@@ -38,6 +43,24 @@ static Chassis_Upload_Data_s chassis_fetch_data; // 从底盘应用接收的反�
 
 RC_ctrl_t *rc_data;                     // 遥控器数据,初始化时返回(全局,供其他模块extern)
 static Vision_Recv_s *vision_recv_data; // 视觉接收数据指针,初始化时返回
+
+#ifdef GIMBAL_BOARD
+/* 0x313载荷为单个float。CAN硬件负责帧CRC，这里检查DLC和数值范围。 */
+static void ChassisGyroRxCallback(CANInstance *can_instance)
+{
+    if (can_instance->rx_len != sizeof(float))
+        return;
+
+    float gyro_z;
+    memcpy(&gyro_z, can_instance->rx_buff, sizeof(gyro_z));
+    if (gyro_z != gyro_z || gyro_z > 20.0f || gyro_z < -20.0f)
+        return;
+
+    chassis_gyro_z = gyro_z;
+    chassis_gyro_rx_timestamp_ms = DWT_GetTimeline_ms();
+    chassis_gyro_received = 1;
+}
+#endif
 static Vision_Send_s vision_send_data;  // 视觉发送数据
 static Nav_Recv_s *nav_recv_data;
 
@@ -117,6 +140,15 @@ void RobotCMDInit()
         .send_data_len = sizeof(Chassis_Ctrl_Cmd_s),
     };
     cmd_can_comm = CANCommInit(&comm_conf);
+
+    CAN_Init_Config_s gyro_can_conf = {
+        .can_handle = &hcan1,
+        .tx_id = CAN_ID_GIMBAL_GYRO_Z,
+        .rx_id = CAN_ID_CHASSIS_GYRO_Z,
+        .can_module_callback = ChassisGyroRxCallback,
+    };
+    CANInstance *chassis_gyro_can = CANRegister(&gyro_can_conf);
+    CANSetDLC(chassis_gyro_can, sizeof(float));
 #endif // GIMBAL_BOARD
     gimbal_cmd_send.pitch = 0;
 
@@ -139,15 +171,15 @@ static float WrapAngle(float target, float current)
 }
 
 /**
- * @brief 根据gimbal app传回的当前电机角度计算和零位的误差
- *        单圈绝对角度的范围是0~360,说明文档中有图示
+ * @brief 根据云台大yaw当前单圈角度计算云台相对底盘的方向偏角
+ *        底盘收到的 vx/vy 将按该角度旋转，因此 vx>0 始终沿云台朝向前进
  *
  */
 static void CalcOffsetAngle()
 {
     // 别名angle提高可读性,不然太长了不好看,虽然基本不会动这个函数
     static float angle;
-    angle = gimbal_fetch_data.yaw_motor_single_round_angle; // 从云台获取的当前yaw电机单圈角度
+    angle = GimbalGetYawSingleRoundAngle(); // 直接读取云台大yaw反馈，避免依赖未发布的旧反馈消息
 #if YAW_ECD_GREATER_THAN_4096                               // 如果大于180度
     chassis_cmd_send.offset_angle = angle - YAW_ALIGN_ANGLE;
     chassis_cmd_send.offset_angle = chassis_cmd_send.offset_angle < 180 ? chassis_cmd_send.offset_angle : -(360 - chassis_cmd_send.offset_angle);
@@ -551,6 +583,15 @@ void RobotCMDTask()
 #endif // ONE_BOARD
 #ifdef GIMBAL_BOARD
     chassis_fetch_data = *(Chassis_Upload_Data_s *)CANCommGet(cmd_can_comm);
+    // 高频单帧超过50ms未更新时回退到完整反馈，避免单帧断线后保留旧前馈。
+    float chassis_gyro_age_ms = DWT_GetTimeline_ms() - chassis_gyro_rx_timestamp_ms;
+    uint8_t chassis_gyro_online = chassis_gyro_received &&
+                                  chassis_gyro_age_ms < CHASSIS_GYRO_TIMEOUT_MS;
+    GimbalSetChassisYawRate(chassis_gyro_online
+                                ? chassis_gyro_z
+                                : (CANCommIsOnline(cmd_can_comm)
+                                       ? chassis_fetch_data.chassis_gyro_z
+                                       : 0.0f));
 #endif // GIMBAL_BOARD
     SubGetMessage(shoot_feed_sub, &shoot_fetch_data);
     SubGetMessage(gimbal_feed_sub, &gimbal_fetch_data);

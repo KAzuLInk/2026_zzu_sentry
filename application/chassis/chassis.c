@@ -12,6 +12,7 @@
 #include "buzzer.h"
 #include "power_meter.h"
 #include "remote_control.h"
+#include <string.h>
 
 /* 根据robot_def.h中的macro自动计算的参数 */
 #define HALF_WHEEL_BASE (WHEEL_BASE / 2.0f)     // 半轴距
@@ -23,6 +24,7 @@
 #include "can_comm.h"
 #include "ins_task.h"
 static CANCommInstance *chasiss_can_comm; // 双板通信CAN comm
+static CANInstance *chassis_gyro_can;     // 独立100Hz底盘yaw角速度单帧CAN
 attitude_t *Chassis_IMU_data;
 #endif // CHASSIS_BOARD
 #ifdef ONE_BOARD
@@ -46,6 +48,7 @@ static SuperCapInstance *cap;                                       // 超级电
 static DJIMotorInstance *motor_lf, *motor_rf, *motor_lb, *motor_rb; // left right forward back
 
 static PIDInstance chassis_follow_to_yaw_pid;
+static PIDInstance chassis_yaw_hold_pid;
 static BuzzzerInstance *buzzerc;
 static Subscriber_t *gimbal_feed_sub;          // 云台反馈信息订阅者
 static Gimbal_Upload_Data_s gimbal_fetch_data; // 从云台获取的反馈信息
@@ -58,6 +61,15 @@ extern RC_ctrl_t *rc_data;
 /* 私有函数计算的中介变量,设为静态避免参数传递的开销 */
 static float chassis_vx, chassis_vy;     // 将云台系的速度投影到底盘
 static float vt_lf, vt_rf, vt_lb, vt_rb; // 底盘速度解算后的临时输出,待进行限幅
+
+/* 直线航向保持诊断量：仅在普通平移模式下生效，小陀螺模式不会使用。 */
+volatile float chassis_yaw_hold_target_debug;
+volatile float chassis_yaw_hold_error_debug;
+volatile float chassis_yaw_hold_output_debug;
+volatile uint8_t chassis_yaw_hold_active_debug;
+
+#define CHASSIS_YAW_HOLD_MOVE_THRESHOLD 500.0f // 低于此速度不锁航向，避免摇杆噪声触发
+#define CHASSIS_YAW_HOLD_MAX_WZ 3000.0f        // 航向修正最大旋转量，单位同 chassis_cmd_recv.wz
 
 
 void ChassisInit()
@@ -104,6 +116,20 @@ void ChassisInit()
         .DeadBand = 4};
 
     PIDInit(&chassis_follow_to_yaw_pid, &chassis_follow_to_yaw_config);
+
+    /* 普通平移时锁定底盘当前yaw，输出仅作为wz修正；小陀螺模式跳过此PID。 */
+    PID_Init_Config_s chassis_yaw_hold_config = {
+        .Kp = 70.0f,
+        .Ki = 0.0f,
+        .Kd = 3.0f,
+        .Derivative_LPF_RC = 0.05f,
+        .IntegralLimit = 0.0f,
+        .Improve = PID_Derivative_On_Measurement | PID_DerivativeFilter,
+        .MaxOut = CHASSIS_YAW_HOLD_MAX_WZ,
+        .MaxOut_ = -CHASSIS_YAW_HOLD_MAX_WZ,
+        .DeadBand = 0.5f,
+    };
+    PIDInit(&chassis_yaw_hold_pid, &chassis_yaw_hold_config);
 
     chassis_motor_config.can_init_config.tx_id = 2;
     chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_REVERSE;
@@ -153,6 +179,15 @@ void ChassisInit()
         .send_data_len = sizeof(Chassis_Upload_Data_s),
     };
     chasiss_can_comm = CANCommInit(&comm_conf); // can comm初始化
+
+    // gyro_z独立单帧上报，避免约95B完整反馈的50Hz分包延迟。
+    CAN_Init_Config_s gyro_can_conf = {
+        .can_handle = &hcan2,
+        .tx_id = CAN_ID_CHASSIS_GYRO_Z,
+        .rx_id = CAN_ID_GIMBAL_GYRO_Z,
+    };
+    chassis_gyro_can = CANRegister(&gyro_can_conf);
+    CANSetDLC(chassis_gyro_can, sizeof(float));
 #endif                                          // CHASSIS_BOARD
 
     Buzzer_config_s buzzer = {
@@ -258,6 +293,73 @@ static void EstimateSpeed()
     //  ...
 }
 
+#if defined(CHASSIS_BOARD) || defined(ONE_BOARD)
+/* 航向误差采用最短路径，避免yaw从+180跳到-180时产生大修正。 */
+static float ChassisWrapYawError(float error)
+{
+    while (error > 180.0f)
+        error -= 360.0f;
+    while (error < -180.0f)
+        error += 360.0f;
+    return error;
+}
+
+static void ResetChassisYawHold(void)
+{
+    chassis_yaw_hold_pid.Iout = 0.0f;
+    chassis_yaw_hold_pid.ITerm = 0.0f;
+    chassis_yaw_hold_pid.Last_Err = 0.0f;
+    chassis_yaw_hold_pid.Last_Measure = 0.0f;
+    chassis_yaw_hold_pid.Last_Output = 0.0f;
+    chassis_yaw_hold_pid.Last_Dout = 0.0f;
+    chassis_yaw_hold_pid.Output = 0.0f;
+    chassis_yaw_hold_target_debug = 0.0f;
+    chassis_yaw_hold_error_debug = 0.0f;
+    chassis_yaw_hold_output_debug = 0.0f;
+    chassis_yaw_hold_active_debug = 0;
+}
+
+/* 普通平移时保持底盘当前航向；小陀螺/旋转模式不会调用此函数。 */
+static void UpdateChassisYawHold(void)
+{
+    float current_yaw;
+    float move_vx = chassis_cmd_recv.vx;
+    float move_vy = chassis_cmd_recv.vy;
+
+    if (move_vx < 0.0f) move_vx = -move_vx;
+    if (move_vy < 0.0f) move_vy = -move_vy;
+    if (move_vx < CHASSIS_YAW_HOLD_MOVE_THRESHOLD &&
+        move_vy < CHASSIS_YAW_HOLD_MOVE_THRESHOLD)
+    {
+        ResetChassisYawHold();
+        return;
+    }
+
+    INS_GetAttitude(&current_yaw, NULL, NULL);
+    if (!chassis_yaw_hold_active_debug)
+    {
+        chassis_yaw_hold_target_debug = current_yaw;
+        chassis_yaw_hold_active_debug = 1;
+        /* 目标角刚锁定，避免沿用上一次运动的微分项。 */
+        chassis_yaw_hold_pid.Iout = 0.0f;
+        chassis_yaw_hold_pid.ITerm = 0.0f;
+        chassis_yaw_hold_pid.Last_Err = 0.0f;
+        chassis_yaw_hold_pid.Last_Measure = current_yaw;
+        chassis_yaw_hold_pid.Last_Output = 0.0f;
+        chassis_yaw_hold_pid.Last_Dout = 0.0f;
+    }
+
+    chassis_yaw_hold_error_debug = ChassisWrapYawError(chassis_yaw_hold_target_debug - current_yaw);
+    /* 把误差折回当前角度附近，既处理±180°环绕，也保留角度微分阻尼。 */
+    float target_yaw = current_yaw + chassis_yaw_hold_error_debug;
+    /* PID的输出单位与底盘wz一致，正负方向由底盘yaw误差自动决定。 */
+    chassis_cmd_recv.wz = PIDCalculate(&chassis_yaw_hold_pid,
+                                        current_yaw,
+                                        target_yaw);
+    chassis_yaw_hold_output_debug = chassis_cmd_recv.wz;
+}
+#endif
+
 /* 机器人底盘控制核心任务 */
 void ChassisTask()
 {
@@ -346,12 +448,21 @@ void ChassisTask()
      case CHASSIS_NO_FOLLOW: // 底盘不旋转,但维持全向机动,一般用于调整云台姿态
 
         chassis_cmd_recv.wz = 0;
+#if defined(CHASSIS_BOARD) || defined(ONE_BOARD)
+        UpdateChassisYawHold();
+#endif
         break;
     case CHASSIS_FOLLOW_GIMBAL_YAW: // 跟随云台,不单独设置pid,以误差角度平方为速度输出
+#if defined(CHASSIS_BOARD) || defined(ONE_BOARD)
+        ResetChassisYawHold();
+#endif
         // chassis_cmd_recv.wz = -1.5 * chassis_cmd_recv.offset_angle * abs(chassis_cmd_recv.offset_angle) - REAL_WZ_RAT*gimbal_fetch_data.gimbal_imu_data.Gyro[2];
         chassis_cmd_recv.wz = PIDCalculate(&chassis_follow_to_yaw_pid, chassis_cmd_recv.offset_angle, 0) - 0.5 * REAL_WZ_RAT * gimbal_fetch_data.gimbal_imu_data.Gyro[2];
         break;
     case CHASSIS_ROTATE:              // 自旋,同时保持全向机动;当前wz维持定值,后续增加不规则的变速策略
+#if defined(CHASSIS_BOARD) || defined(ONE_BOARD)
+        ResetChassisYawHold();
+#endif
         if (chassis_cmd_recv.wz == 0) // 视觉有数据就用视觉的
         {
             chassis_cmd_recv.wz = 2000;
@@ -362,11 +473,14 @@ void ChassisTask()
         }
         break;
     default:
+#if defined(CHASSIS_BOARD) || defined(ONE_BOARD)
+        ResetChassisYawHold();
+#endif
         break;
     }
-    
-    // 根据云台和底盘的角度offset将控制量映射到底盘坐标系上
-    // 底盘逆时针旋转为角度正方向;云台命令的方向以云台指向的方向为x,采用右手系(x指向正北时y在正东)
+
+    // 导航/遥控输入以云台朝向为x正方向、左侧为y正方向；
+    // 根据云台相对底盘的offset旋转到底盘坐标系后再做轮速解算。
     static float sin_theta, cos_theta;
     cos_theta = arm_cos_f32(chassis_cmd_recv.offset_angle * DEGREE_2_RAD);
     sin_theta = arm_sin_f32(chassis_cmd_recv.offset_angle * DEGREE_2_RAD);
@@ -439,6 +553,10 @@ void ChassisTask()
         chassis_feedback_data.chassis_gyro_x = gx;
         chassis_feedback_data.chassis_gyro_y = gy;
         chassis_feedback_data.chassis_gyro_z = gz;
+
+        // ChassisTask当前100Hz；单独发送gyro_z只占一帧，不提高完整反馈包频率。
+        memcpy(chassis_gyro_can->tx_buff, &gz, sizeof(gz));
+        CANTransmit(chassis_gyro_can, 1.0f);
     }
 #endif
 
