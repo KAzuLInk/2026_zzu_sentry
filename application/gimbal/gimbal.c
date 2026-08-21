@@ -206,6 +206,8 @@ volatile float yaw_motor_ref_debug; // 诊断用: 大yaw速度指令 → DMMotor
 float gyro_lpf_val;          // 陀螺仪滤波后的值 (rad/s)
 float gyro_lpf_rc = 0.03f;    // LPF的RC常数, Ozone可改: 越大滤波越强
 uint32_t gyro_lpf_dwt;       // LPF时间戳
+static float yaw_chassis_rate_rad_s;            // 底盘IMU yaw角速度(rad/s)
+static const float yaw_chassis_ff_gain = 1.0f;  // 电机相对底盘速度补偿比例
 volatile uint8_t rc_online;        // 遥控器在线状态
 volatile float pitch_debug_rockr;  // 摇杆
 volatile float pitch_debug_ref;    // 目标角度 rad
@@ -259,6 +261,15 @@ static float WrapAngleDeg(float target, float current)
     return current + error;
 }
 
+void GimbalSetChassisYawRate(float yaw_rate_rad_s)
+{
+    /* 拒绝NaN和明显异常值，双板通信离线时调用方传0。 */
+    if (yaw_rate_rad_s != yaw_rate_rad_s ||
+        yaw_rate_rad_s > 20.0f || yaw_rate_rad_s < -20.0f)
+        yaw_rate_rad_s = 0.0f;
+    yaw_chassis_rate_rad_s = yaw_rate_rad_s;
+}
+
 /* 小yaw位置闭环到指定ecd(绝对值映射, 不累积), 带机械限位 */
 static void SmallYawSetEcd(uint16_t ecd_target)
 {
@@ -307,6 +318,22 @@ static float GyroLPF(float gyro_raw)
     return gyro_lpf_val;
 }
 
+/* 大yaw速度环: 世界系目标角速度 → 电机相对底盘速度指令。 */
+static void BigYawSpeedControl(float target_vel_rad)
+{
+    if (gimba_IMU_data == NULL)
+        return;
+    float current_gyro_z = gimba_IMU_data->Gyro[2] * GYRO2GIMBAL_DIR_YAW; // rad/s
+    float gyro_lpf = GyroLPF(current_gyro_z);
+    /* MIT的velocity_des是电机相对底盘的转速，而target_vel_rad是世界系云台角速度。
+     * 因此提前减去底盘角速度，避免必须先产生角度误差才能抵消小陀螺旋转。 */
+    float chassis_velocity_ff = -yaw_chassis_rate_rad_s * yaw_chassis_ff_gain;
+    float motor_ref = target_vel_rad + chassis_velocity_ff
+                    + PIDCalculate(&yaw_speed_pid, gyro_lpf, target_vel_rad);
+    yaw_motor_ref_debug = motor_ref;
+    DMMotorSetRef(yaw_motor, motor_ref);
+}
+
 /* 大yaw角度环 + 速度环 → DMMotorSetRef, ref为惯性空间绝对角(°) */
 static void BigYawAngleControl(float angle_ref)
 {
@@ -314,12 +341,7 @@ static void BigYawAngleControl(float angle_ref)
         return;
     float current_angle = gimba_IMU_data->YawTotalAngle;
     float target_vel = PIDCalculate(&yaw_angle_pid, current_angle, angle_ref); // °/s
-    float target_vel_rad = target_vel * DEGREE_2_RAD;                          // °/s → rad/s
-    float current_gyro_z = gimba_IMU_data->Gyro[2] * GYRO2GIMBAL_DIR_YAW;      // rad/s
-    float gyro_lpf = GyroLPF(current_gyro_z);
-    float motor_ref = target_vel_rad + PIDCalculate(&yaw_speed_pid, gyro_lpf, target_vel_rad);
-    yaw_motor_ref_debug = motor_ref;
-    DMMotorSetRef(yaw_motor, motor_ref);
+    BigYawSpeedControl(target_vel * DEGREE_2_RAD);                              // °/s → rad/s
 }
 
 /* 拨杆 → 控制模式 单一真值源 */
@@ -433,14 +455,7 @@ static void GimbalHandleSpeed(void)
         float stick = rc_data[TEMP].rc.rocker_r_;           // -660 ~ +660
         if (stick > -20.0f && stick < 20.0f) stick = 0.0f;  // 中心死区, 防漂移
         float target_vel_deg = stick / 660.0f * yaw_speed_ref_deg;
-        float target_vel_rad = target_vel_deg * DEGREE_2_RAD; // °/s → rad/s
-
-        float current_gyro_z = gimba_IMU_data->Gyro[2] * GYRO2GIMBAL_DIR_YAW; // rad/s
-        float gyro_lpf = GyroLPF(current_gyro_z);
-        float motor_ref = target_vel_rad + PIDCalculate(&yaw_speed_pid, gyro_lpf, target_vel_rad);
-
-        yaw_motor_ref_debug = motor_ref;
-        DMMotorSetRef(yaw_motor, motor_ref);
+        BigYawSpeedControl(target_vel_deg * DEGREE_2_RAD);   // °/s → rad/s
     }
 }
 
@@ -703,6 +718,19 @@ float GimbalGetPitchPosition(void)
     if (pitch_motor == NULL)
         return 0.0f;
     return pitch_motor->measure.position;
+}
+
+/* 大yaw单圈角度（度），用于把导航速度从云台坐标系转换到底盘坐标系 */
+float GimbalGetYawSingleRoundAngle(void)
+{
+    if (yaw_motor == NULL)
+        return 0.0f;
+
+    // 达妙位置反馈为[-pi, pi] rad，这里转换为旧接口使用的[0, 360) deg。
+    float angle_deg = yaw_motor->measure.position * RAD_2_DEGREE;
+    if (angle_deg < 0.0f)
+        angle_deg += 360.0f;
+    return angle_deg;
 }
 
 /* 小yaw(GM6020)相对中心(1300ecd)的偏转角(度)，右正左负，0x12 回传的 small_yaw 字段 */

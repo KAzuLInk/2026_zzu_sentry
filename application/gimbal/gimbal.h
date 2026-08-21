@@ -16,6 +16,12 @@ void GimbalInit();
 void GimbalTask();
 
 /**
+ * @brief 更新底盘绕Z轴角速度，供大yaw惯性自稳前馈使用
+ * @param yaw_rate_rad_s 底盘IMU角速度 (rad/s)
+ */
+void GimbalSetChassisYawRate(float yaw_rate_rad_s);
+
+/**
  * @brief 判断视觉目标是否已经进入允许开火的角度窗口
  * @param tolerance_deg yaw、pitch 允许误差（度）
  * @return 1=视觉锁敌且两轴均到位，0=未锁敌或未到位
@@ -35,6 +41,12 @@ void GimbalGetMotorFeedback(int16_t speed[2], int32_t pos[2], int16_t cur[2]);
  * @return pitch 电机位置 (rad)
  */
 float GimbalGetPitchPosition(void);
+
+/**
+ * @brief 获取大yaw电机单圈角度（供底盘移动坐标变换使用）
+ * @return 相对安装零位的单圈角度（度，0~360）
+ */
+float GimbalGetYawSingleRoundAngle(void);
 
 /**
  * @brief 获取小yaw(GM6020)相对中心(1300ecd)的偏转角（供视觉回传 0x12 的 small_yaw 字段使用）

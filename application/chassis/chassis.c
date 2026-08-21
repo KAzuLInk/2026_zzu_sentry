@@ -12,6 +12,7 @@
 #include "buzzer.h"
 #include "power_meter.h"
 #include "remote_control.h"
+#include <string.h>
 
 /* 根据robot_def.h中的macro自动计算的参数 */
 #define HALF_WHEEL_BASE (WHEEL_BASE / 2.0f)     // 半轴距
@@ -23,6 +24,7 @@
 #include "can_comm.h"
 #include "ins_task.h"
 static CANCommInstance *chasiss_can_comm; // 双板通信CAN comm
+static CANInstance *chassis_gyro_can;     // 独立100Hz底盘yaw角速度单帧CAN
 attitude_t *Chassis_IMU_data;
 #endif // CHASSIS_BOARD
 #ifdef ONE_BOARD
@@ -153,6 +155,15 @@ void ChassisInit()
         .send_data_len = sizeof(Chassis_Upload_Data_s),
     };
     chasiss_can_comm = CANCommInit(&comm_conf); // can comm初始化
+
+    // gyro_z独立单帧上报，避免约95B完整反馈的50Hz分包延迟。
+    CAN_Init_Config_s gyro_can_conf = {
+        .can_handle = &hcan2,
+        .tx_id = CAN_ID_CHASSIS_GYRO_Z,
+        .rx_id = CAN_ID_GIMBAL_GYRO_Z,
+    };
+    chassis_gyro_can = CANRegister(&gyro_can_conf);
+    CANSetDLC(chassis_gyro_can, sizeof(float));
 #endif                                          // CHASSIS_BOARD
 
     Buzzer_config_s buzzer = {
@@ -364,9 +375,9 @@ void ChassisTask()
     default:
         break;
     }
-    
-    // 根据云台和底盘的角度offset将控制量映射到底盘坐标系上
-    // 底盘逆时针旋转为角度正方向;云台命令的方向以云台指向的方向为x,采用右手系(x指向正北时y在正东)
+
+    // 导航/遥控输入以云台朝向为x正方向、左侧为y正方向；
+    // 根据云台相对底盘的offset旋转到底盘坐标系后再做轮速解算。
     static float sin_theta, cos_theta;
     cos_theta = arm_cos_f32(chassis_cmd_recv.offset_angle * DEGREE_2_RAD);
     sin_theta = arm_sin_f32(chassis_cmd_recv.offset_angle * DEGREE_2_RAD);
@@ -439,6 +450,10 @@ void ChassisTask()
         chassis_feedback_data.chassis_gyro_x = gx;
         chassis_feedback_data.chassis_gyro_y = gy;
         chassis_feedback_data.chassis_gyro_z = gz;
+
+        // ChassisTask当前100Hz；单独发送gyro_z只占一帧，不提高完整反馈包频率。
+        memcpy(chassis_gyro_can->tx_buff, &gz, sizeof(gz));
+        CANTransmit(chassis_gyro_can, 1.0f);
     }
 #endif
 

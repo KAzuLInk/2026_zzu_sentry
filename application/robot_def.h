@@ -47,6 +47,10 @@
 #define GYRO2GIMBAL_DIR_ROLL -1  // 陀螺仪数据相较于云台的roll的方向,1为相同,-1为相反
 #define HUBS_NUMBER 4 // 轮子数量,底盘是四轮全向轮,如果是两轮差速轮需要修改为2,如果是平衡步兵需要修改为2
 
+/* 双板间高频底盘yaw角速度单帧CAN。0x314为对端预留ID，当前不发送数据。 */
+#define CAN_ID_CHASSIS_GYRO_Z 0x313U
+#define CAN_ID_GIMBAL_GYRO_Z  0x314U
+
 
 // 检查是否出现主控板定义冲突,只允许一个开发板定义存在,否则编译会自动报错
 #if (defined(ONE_BOARD) && defined(CHASSIS_BOARD)) || \
