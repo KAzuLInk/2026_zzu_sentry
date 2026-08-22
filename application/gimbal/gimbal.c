@@ -203,6 +203,8 @@ void GimbalInit()
  *  级联输出 → DMMotorSetRef → MIT velocity_des
  */
 volatile float yaw_motor_ref_debug; // 诊断用: 大yaw速度指令 → DMMotorSetRef
+volatile float yaw_position_rad_debug;     // 诊断: 大yaw DM4310 原始位置 (rad, [-pi,pi]) — Ozone标定"车头方向"用
+volatile float yaw_single_round_deg_debug; // 诊断: 大yaw 单圈角度 (deg, [0,360)) — CalcOffsetAngle实际使用的值
 float gyro_lpf_val;          // 陀螺仪滤波后的值 (rad/s)
 float gyro_lpf_rc = 0.03f;    // LPF的RC常数, Ozone可改: 越大滤波越强
 uint32_t gyro_lpf_dwt;       // LPF时间戳
@@ -552,6 +554,15 @@ static void GimbalHandlePitch(uint8_t vision_mode, uint8_t vision_locked)
 
 void GimbalTask()
 {
+    // 诊断: 每拍刷新大yaw编码器值, Ozone看这两个变量标定"车头方向"对应的角度
+    if (yaw_motor != NULL)
+    {
+        yaw_position_rad_debug = yaw_motor->measure.position;
+        float a = yaw_position_rad_debug * RAD_2_DEGREE;
+        if (a < 0.0f) a += 360.0f;
+        yaw_single_round_deg_debug = a;
+    }
+
     gimbal_ctl_mode_e mode = GimbalDecodeMode();   // ① 拨杆 → 状态
     GimbalSmallYawInit();                            // ② 上电一次性初始化(与状态无关)
 

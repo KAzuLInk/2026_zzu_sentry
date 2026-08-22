@@ -17,6 +17,7 @@
 #include "go_motor.h"
 #include "dmmotor.h"
 #include "bsp_log.h"
+#include "bsp_can.h"
 
 osThreadId insTaskHandle;
 osThreadId robotTaskHandle;
@@ -106,6 +107,7 @@ __attribute__((noreturn)) void StartDAEMONTASK(void const *argument)
         // 100Hz
         daemon_start = DWT_GetTimeline_ms();
         DaemonTask();
+        CANBusOffRecovery(); // FDCAN bus-off 检测恢复, 支持电机热插拔
         BuzzerTask();
         daemon_dt = DWT_GetTimeline_ms() - daemon_start;
         if (daemon_dt > 10)

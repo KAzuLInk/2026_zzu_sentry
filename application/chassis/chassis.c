@@ -54,6 +54,19 @@ static Gimbal_Upload_Data_s gimbal_fetch_data; // 从云台获取的反馈信息
 
 static PowerMeterInstance *power_meter; // 功率计实例
 extern RC_ctrl_t *rc_data;
+
+/* 诊断: 双板通信 + 轮子在线状态 (Ozone观察)
+ * chassis_cmd_online = 云台板CAN是否在线(底盘收到0x312指令)
+ * wheel_*_online      = 四个轮子电机(M3508)是否正常反馈 */
+volatile uint8_t chassis_cmd_online_debug;  // 1=云台→底盘CAN在线
+volatile uint8_t chassis_cmd_mode_debug;    // 收到的chassis_mode (0=ZERO_FORCE急停)
+volatile float   chassis_cmd_vx_debug;      // 收到的vx (云台系前进速度)
+volatile float   chassis_cmd_vy_debug;      // 收到的vy (云台系左移速度)
+volatile float   chassis_cmd_offset_debug;  // 收到的offset_angle (度)
+volatile uint8_t wheel_lf_online_debug;     // 左前轮在线
+volatile uint8_t wheel_rf_online_debug;     // 右前轮在线
+volatile uint8_t wheel_lb_online_debug;     // 左后轮在线
+volatile uint8_t wheel_rb_online_debug;     // 右后轮在线
 /* 用于自旋变速策略的时间变量 */
 // static float t;
 
@@ -324,6 +337,19 @@ void ChassisTask()
         chassis_cmd_recv.wz = 0;
     }
 #endif // CHASSIS_BOARD
+
+    // 诊断: 刷新Ozone观察变量(双板通信在线 + 收到的指令 + 轮子电机在线)
+#ifdef CHASSIS_BOARD
+    chassis_cmd_online_debug = CANCommIsOnline(chasiss_can_comm);
+#endif
+    chassis_cmd_mode_debug   = chassis_cmd_recv.chassis_mode;
+    chassis_cmd_vx_debug     = chassis_cmd_recv.vx;
+    chassis_cmd_vy_debug     = chassis_cmd_recv.vy;
+    chassis_cmd_offset_debug = chassis_cmd_recv.offset_angle;
+    wheel_lf_online_debug = (motor_lf != NULL) ? DaemonIsOnline(motor_lf->daemon) : 0;
+    wheel_rf_online_debug = (motor_rf != NULL) ? DaemonIsOnline(motor_rf->daemon) : 0;
+    wheel_lb_online_debug = (motor_lb != NULL) ? DaemonIsOnline(motor_lb->daemon) : 0;
+    wheel_rb_online_debug = (motor_rb != NULL) ? DaemonIsOnline(motor_rb->daemon) : 0;
 
     // 仅在模式切换时改变电机使能状态,避免每周期重复设置
     static chassis_mode_e prev_mode = CHASSIS_ZERO_FORCE;
