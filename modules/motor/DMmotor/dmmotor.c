@@ -414,11 +414,12 @@ void DMMotorTask(void const *argument)
     }
 
     // 归零 (仅MIT模式需要, 原生模式使用绝对值编码器不需要)
-    if (motor->native_mode == 0)
-    {
-        DMMotorCaliEncoder(motor);
-        osDelay(1);
-    }
+    // 已禁用：保留达妙内部编码器零点，启动时不再把电机当前位置写为零点。
+    // if (motor->native_mode == 0)
+    // {
+    //     DMMotorCaliEncoder(motor);
+    //     osDelay(1);
+    // }
 
    
    

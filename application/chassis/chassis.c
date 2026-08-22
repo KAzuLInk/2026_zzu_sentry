@@ -449,7 +449,7 @@ void ChassisTask()
 
         chassis_cmd_recv.wz = 0;
 #if defined(CHASSIS_BOARD) || defined(ONE_BOARD)
-        UpdateChassisYawHold();
+        // UpdateChassisYawHold(); // 暂时关闭航向保持，先验证底盘开环平移是否能走直
 #endif
         break;
     case CHASSIS_FOLLOW_GIMBAL_YAW: // 跟随云台,不单独设置pid,以误差角度平方为速度输出

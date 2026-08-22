@@ -170,7 +170,7 @@ void GimbalInit()
         .MaxOut_ = -2.0f,
         .DeadBand = 0.0f,                      // 死区 0.01 rad/s ≈ 0.57°/s
         .IntegralLimit = 1.0f,                  // 积分限幅 ±1 rad/s
-        .Improve = PID_Integral_Limit,
+        .Improve = PID_Integral_Limit | PID_OutputFilter,
         .Derivative_LPF_RC = 0.0f,
         .Output_LPF_RC = 0.01f,                 // 输出低通滤波, 抑制毛刺
     };
@@ -783,10 +783,11 @@ float GimbalGetYawSingleRoundAngle(void)
     if (yaw_motor == NULL)
         return 0.0f;
 
-    // 达妙位置反馈为[-pi, pi] rad，这里转换为旧接口使用的[0, 360) deg。
-    float angle_deg = yaw_motor->measure.position * RAD_2_DEGREE;
-    if (angle_deg < 0.0f)
-        angle_deg += 360.0f;
+    // 达妙位置反馈为rad，减去机械对齐标定值后转换为有符号角度。
+    float angle_deg =
+        (yaw_motor->measure.position - YAW_CHASSIS_ALIGN_POSITION_RAD) * RAD_2_DEGREE;
+    while (angle_deg >= 180.0f) angle_deg -= 360.0f;
+    while (angle_deg < -180.0f) angle_deg += 360.0f;
     return angle_deg;
 }
 
