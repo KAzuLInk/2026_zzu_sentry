@@ -44,7 +44,7 @@ float GimbalGetPitchPosition(void);
 
 /**
  * @brief 获取大yaw电机单圈角度（供底盘移动坐标变换使用）
- * @return 相对安装零位的单圈角度（度，0~360）
+ * @return 相对底盘+Vx的有符号角度（度，-180~180）
  */
 float GimbalGetYawSingleRoundAngle(void);
 
