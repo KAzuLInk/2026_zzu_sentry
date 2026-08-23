@@ -17,7 +17,21 @@ typedef struct daemon_ins
 
     uint16_t temp_count; // 当前值,减为零说明模块离线或异常
     void *owner_id;      // daemon实例的地址,初始化的时候填入
+    uint8_t alarm_silent; // 1=该模块掉线不触发蜂鸣器报警(暂时静音), 0=正常报警
+    const char *name;     // 模块名(诊断显示, Ozone看daemon_status[]用)
+    uint32_t reload_cnt;  // 累计喂狗次数(诊断)
 } DaemonInstance;
+
+/* 诊断用: 每个daemon实例的实时状态, Ozone直接观察该数组 */
+typedef struct
+{
+    const char *name;    // 模块名
+    uint8_t online;      // 1=在线, 0=离线
+    uint32_t reload_cnt; // 累计喂狗次数
+} Daemon_Status_s;
+
+/* 全局诊断数组, 按注册顺序(idx)排列, DaemonTask每拍刷新 */
+extern Daemon_Status_s daemon_status[DAEMON_MX_CNT];
 
 /* daemon初始化配置 */
 typedef struct
@@ -27,6 +41,8 @@ typedef struct
     offline_callback callback; // 异常处理函数,当模块发生异常时会被调用
 
     void *owner_id;            // id取拥有daemon的实例的地址,如DJIMotorInstance*,cast成void*类型
+    uint8_t alarm_silent;      // 1=该模块掉线不触发蜂鸣器报警(暂时静音), 0=正常报警
+    const char *name;          // 模块名(诊断显示)
 } Daemon_Init_Config_s;
 
 /**

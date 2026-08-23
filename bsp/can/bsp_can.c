@@ -325,7 +325,7 @@ static void FDCANFIFOxCallback(FDCAN_HandleTypeDef *_hfdcan, uint32_t fifox)
 						memcpy(can_instance[i]->rx_buff, fdcan_rx_buff, can_instance[i]->rx_len); // 消息拷贝到对应实例
 						can_instance[i]->can_module_callback(can_instance[i]);     // 触发回调进行数据解析和处理
 					}
-					return;
+					break; // 匹配已处理, 跳出for继续while处理FIFO剩余帧(不能return, 否则每次中断只处理一帧)
 				}
 			}
         }

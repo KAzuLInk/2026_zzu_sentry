@@ -327,6 +327,7 @@ DMMotorInstance *DMMotorInit(Motor_Init_Config_s *config)
         .callback = DMMotorLostCallback,
         .owner_id = motor,
         .reload_count = 10,
+        .name = "dm4310",
     };
     motor->motor_daemon = DaemonRegister(&conf);
 

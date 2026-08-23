@@ -224,6 +224,7 @@ DJIMotorInstance *DJIMotorInit(Motor_Init_Config_s *config)
         .callback = DJIMotorLostCallback,
         .owner_id = instance,
         .reload_count = 10, // 100ms未收到数据则丢失(与DM电机对齐, 减少CAN瞬时丢帧误报)
+        .name = "djimotor",
     };
     instance->daemon = DaemonRegister(&daemon_config);
 

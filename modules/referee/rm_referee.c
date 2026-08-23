@@ -159,6 +159,8 @@ referee_info_t *RefereeInit(UART_HandleTypeDef *referee_usart_handle)
 		.callback = RefereeLostCallback,
 		.owner_id = referee_usart_instance,
 		.reload_count = 30, // 0.3s没有收到数据,则认为丢失,重启串口接收
+		.alarm_silent = 1, // 裁判系统掉线暂不触发蜂鸣器报警
+		.name = "referee",
 	};
 	referee_daemon = DaemonRegister(&daemon_conf);
 

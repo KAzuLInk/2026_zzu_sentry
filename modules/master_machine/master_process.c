@@ -182,6 +182,8 @@ Vision_Recv_s *VisionInit(void)
         .callback = VisionOfflineCallback, // 离线时调用的回调函数
         .owner_id = NULL,
         .reload_count = 100, // 离线超过 1s 超时
+        .alarm_silent = 1,   // 视觉掉线暂不触发蜂鸣器报警
+        .name = "vision",
     };
     vision_daemon_instance = DaemonRegister(&daemon_conf);
 

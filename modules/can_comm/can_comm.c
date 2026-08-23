@@ -5,6 +5,12 @@
 #include "bsp_dwt.h"
 #include "bsp_log.h"
 
+/* 诊断: 双板通信接收计数, Ozone观察
+ * rx_frame_cnt = 收到CAN帧数; rx_ok_cnt = 成功收完整包(喂狗)数
+ * frame_cnt 涨但 ok_cnt 不涨 → 拼接/CRC失败; frame_cnt 不涨 → 收不到帧(过滤器/物理/对端没发) */
+volatile uint32_t can_comm_rx_frame_cnt;
+volatile uint32_t can_comm_rx_ok_cnt;
+
 /**
  * @brief 重置CAN comm的接收状态和buffer
  *
@@ -26,6 +32,7 @@ static void CANCommResetRx(CANCommInstance *ins)
 static void CANCommRxCallback(CANInstance *_instance)
 {
     CANCommInstance *comm = (CANCommInstance *)_instance->id; // 注意写法,将can instance的id强制转换为CANCommInstance*类型
+    can_comm_rx_frame_cnt++; // 诊断: 每收到一帧自增
 
     /* 当前接收状态判断 */
     if (_instance->rx_buff[0] == CAN_COMM_HEADER && comm->recv_state == 0) // 之前尚未开始接收且此次包里第一个位置是帧头
@@ -62,6 +69,7 @@ static void CANCommRxCallback(CANInstance *_instance)
                     memcpy(comm->unpacked_recv_data, comm->raw_recvbuf + 2, comm->recv_data_len);
                     comm->update_flag = 1;           // 数据更新flag置为1
                     DaemonReload(comm->comm_daemon); // 重载daemon,避免数据更新后一直不被读取而导致数据更新不及时
+                    can_comm_rx_ok_cnt++;            // 诊断: 成功收完整包(喂狗)
                 }
             }
             CANCommResetRx(comm);
@@ -98,6 +106,7 @@ CANCommInstance *CANCommInit(CANComm_Init_Config_s *comm_config)
         .callback = CANCommLostCallback,
         .owner_id = (void *)ins,
         .reload_count = comm_config->daemon_count,
+        .name = "can_comm",
     };
     ins->comm_daemon = DaemonRegister(&daemon_config);
     return ins;
