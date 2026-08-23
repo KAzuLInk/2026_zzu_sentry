@@ -13,6 +13,8 @@ static BuzzzerInstance *buzzer_list[BUZZER_DEVICE_CNT] = {0};
  */
 void BuzzerInit()
 {
+    if (buzzer != NULL) // 已初始化过, 幂等返回, 防止重复注册 PWM
+        return;
     PWM_Init_Config_s buzzer_config = {
         .htim = &htim12,
         .channel = TIM_CHANNEL_2,
@@ -84,6 +86,15 @@ void BuzzerTask()
                 break;
             case OCTAVE_7:
                 PWMSetPeriod(buzzer, (float)1 / SiFreq);
+                break;
+            case OCTAVE_8:
+                PWMSetPeriod(buzzer, (float)1 / HiDoFreq);
+                break;
+            case OCTAVE_9:
+                PWMSetPeriod(buzzer, (float)1 / HiReFreq);
+                break;
+            case OCTAVE_10:
+                PWMSetPeriod(buzzer, (float)1 / HiMiFreq);
                 break;
             default:
                 break;

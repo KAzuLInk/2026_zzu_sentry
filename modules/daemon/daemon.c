@@ -16,9 +16,9 @@ DaemonInstance *DaemonRegister(Daemon_Init_Config_s *config)
     instance->owner_id = config->owner_id;
     instance->reload_count = config->reload_count == 0 ? 100 : config->reload_count; // 默认值为100
     instance->callback = config->callback;
-    instance->temp_count = config->init_count == 0 ? 100 : config->init_count; // 默认值为100,初始计数
+    // init_count 为 0 时用 reload_count 作为初始计数; 否则用 init_count(上电"上线宽限时间")
+    instance->temp_count = config->init_count == 0 ? instance->reload_count : config->init_count;
 
-    instance->temp_count = config->reload_count;
     daemon_instances[idx++] = instance;
     return instance;
 }
@@ -42,12 +42,13 @@ void DaemonTask()
 
         dins = daemon_instances[i];
         if (dins->temp_count > 0) // 如果计数器还有值,说明上一次喂狗后还没有超时,则计数器减一
-            dins->temp_count--;
-        else if (dins->callback) // 等于零说明超时了,调用回调函数(如果有的话)
         {
-            dins->callback(dins->owner_id); // module内可以将owner_id强制类型转换成自身类型从而调用特定module的offline callback
-            // @todo 为蜂鸣器/led等增加离线报警的功能,非常关键!
+            dins->temp_count--;
+            // 刚减到 0 = 本次超时边沿, 只触发一次回调; 之后停在 0 不再重复触发, 直到喂狗重新上线
+            if (dins->temp_count == 0 && dins->callback)
+                dins->callback(dins->owner_id); // module内可以将owner_id强制类型转换成自身类型从而调用特定module的offline callback
         }
+        // @todo 为蜂鸣器/led等增加离线报警的功能,非常关键!
     }
 }
 // (需要id的原因是什么?) 下面是copilot的回答!

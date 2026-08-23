@@ -23,6 +23,8 @@
 
 static INS_t INS;
 
+volatile uint8_t INS_init_done = 0; // IMU 初始化完成标志(1=完成)
+
 static IMU_Param_t IMU_Param;
 static PIDInstance TempCtrl = {0};
 
@@ -114,6 +116,7 @@ attitude_t *INS_Init(void)
     // noise of accel is relatively big and of high freq,thus lpf is used
     INS.AccelLPF = 0.0085;
     DWT_GetDeltaT(&INS_DWT_Count);
+    INS_init_done = 1; // 标记 IMU 初始化完成(供开机音效判断)
     return (attitude_t *)&INS.Gyro; // @todo: 这里偷懒了,不要这样做! 修改INT_t结构体可能会导致异常,待修复.
 }
 

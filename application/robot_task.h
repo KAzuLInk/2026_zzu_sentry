@@ -24,12 +24,14 @@ osThreadId robotTaskHandle;
 osThreadId motorTaskHandle;
 osThreadId daemonTaskHandle;
 osThreadId uiTaskHandle;
+osThreadId bootTaskHandle;
 
 void StartINSTASK(void const *argument);
 void StartMOTORTASK(void const *argument);
 void StartDAEMONTASK(void const *argument);
 void StartROBOTTASK(void const *argument);
 void StartUITASK(void const *argument);
+void StartBOOTTASK(void const *argument);
 
 /**
  * @brief 初始化机器人任务,所有持续运行的任务都在这里初始化
@@ -37,6 +39,10 @@ void StartUITASK(void const *argument);
  */
 void OSTaskInit()
 {
+    // 开机音效任务: 与 INS 同级, 保证 INS_Init 忙等期间能穿插播放; 播完自杀
+    osThreadDef(boottask, StartBOOTTASK, osPriorityAboveNormal, 0, 256);
+    bootTaskHandle = osThreadCreate(osThread(boottask), NULL);
+
     osThreadDef(instask, StartINSTASK, osPriorityAboveNormal, 0, 1024);
     insTaskHandle = osThreadCreate(osThread(instask), NULL); // 由于是阻塞读取传感器,为姿态解算设置较高优先级,确保以1khz的频率执行
     // 后续修改为读取传感器数据准备好的中断处理,
@@ -94,6 +100,79 @@ __attribute__((noreturn)) void StartMOTORTASK(void const *argument)
             LOGERROR("[freeRTOS] MOTOR Task is being DELAY! dt = [%f]", &motor_dt);
         osDelay(1);
     }
+}
+
+/* 开机音效任务: 上电后循环播前奏直到 IMU 初始化完成, 再滴滴两声, 然后自杀 */
+void StartBOOTTASK(void const *argument)
+{
+    BuzzerInit(); // 幂等, 与 daemon 的调用不冲突
+
+#ifdef GIMBAL_BOARD
+    {
+        Buzzer_config_s boot_cfg = {
+            .alarm_level = ALARM_LEVEL_LOW,   // 最低优先级, 不干扰报警
+            .loudness = 0.5f,
+            .octave = OCTAVE_1,
+        };
+        BuzzzerInstance *boot_buzzer = BuzzerRegister(&boot_cfg);
+
+        // 前奏音: 0=休止, 1~7=中音 do~si, 8/9/10=高音 do/re/mi
+        static const uint8_t boot_note[] = {
+            5, 9, 8, 5, 5, 8, 9, 10, 9, 8, 9,
+            5, 9, 8, 5, 5, 8, 9, 10, 9, 8, 9,
+            5, 9, 8, 5, 5, 8, 9, 10, 9, 8, 9,
+            5, 9, 8, 5,
+        };
+        // 时值编码: 2=八分, 4=四分, 8=二分(末拍 4-4 连音)
+        static const uint8_t boot_dur[] = {
+            4, 4, 4, 4, 4, 2, 2, 2, 2, 2, 2,
+            4, 4, 4, 4, 4, 2, 2, 2, 2, 2, 2,
+            4, 4, 4, 4, 4, 2, 2, 2, 2, 2, 2,
+            4, 4, 4, 8,
+        };
+        const uint32_t boot_beat_ms = 172; // 一拍 172ms, 前奏(29拍) ≈ 5s
+
+        while (!INS_init_done)
+        {
+            const uint32_t note_count = sizeof(boot_note) / sizeof(boot_note[0]);
+            for (uint32_t i = 0; i < note_count; ++i)
+            {
+                uint32_t ms;
+                switch (boot_dur[i])
+                {
+                case 2: ms = boot_beat_ms / 2; break; // 八分 86ms
+                case 4: ms = boot_beat_ms;     break; // 四分 172ms
+                case 8: ms = boot_beat_ms * 2; break; // 二分 344ms
+                default: ms = boot_beat_ms / 2; break;
+                }
+                if (boot_note[i] == 0)
+                    AlarmSetStatus(boot_buzzer, ALARM_OFF); // 休止
+                else
+                {
+                    boot_buzzer->octave = (octave_e)(boot_note[i] - 1); // 1..10 -> OCTAVE_1..OCTAVE_10
+                    AlarmSetStatus(boot_buzzer, ALARM_ON);
+                }
+                BuzzerTask(); // 应用 PWM 设置
+                osDelay(ms);
+            }
+        }
+
+        // 初始化完成: 滴滴两声 (高音 do)
+        for (uint8_t i = 0; i < 2; ++i)
+        {
+            boot_buzzer->octave = OCTAVE_8;
+            AlarmSetStatus(boot_buzzer, ALARM_ON);
+            BuzzerTask();
+            osDelay(150);
+            AlarmSetStatus(boot_buzzer, ALARM_OFF);
+            BuzzerTask();
+            osDelay(100);
+        }
+    }
+#endif
+
+    vTaskDelete(NULL); // 开机音效结束, 删除自己
+    for (;;) {}        // 保险, 不可达
 }
 
 __attribute__((noreturn)) void StartDAEMONTASK(void const *argument)

@@ -83,9 +83,6 @@ static uint8_t flag = 1;
 static float aligned_total_yaw, aligned_total_pitch, delayed_total_yaw, fitter_vision_recv_data_yaw;
 static float send_first, send_first_pitch, send_second;
 
-// 视觉开火请求：收到0x03后先锁存，云台进入±5°窗口后再触发一次拨弹
-static uint8_t vision_shot_pending = 0;
-
 // ====================== 新增：热量管控参数 ======================
 #define HEAT_PER_BULLET 10.0f    // 每发子弹增加热量
 #define HEAT_COOL_RATE 30.0f     // 每秒冷却热量
@@ -214,10 +211,6 @@ static void RemoteControlSet()
     shoot_cmd_send.friction_mode = FRICTION_OFF;
     shoot_cmd_send.load_mode = LOAD_STOP;
 
-    // 离开视觉模式时丢弃尚未执行的视觉开火请求，避免切换模式后误发
-    if (!switch_is_mid(rc_data[TEMP].rc.switch_right))
-        vision_shot_pending = 0;
-
     // 控制底盘和云台运行模式,云台待添加,云台是否始终使用IMU数据?
     gimbal_cmd_send.gimbal_mode = GIMBAL_GYRO_MODE;
     // rc_data[TEMP].rc.switch_left = 3;
@@ -283,7 +276,10 @@ static void RemoteControlSet()
         }
         //  视觉会发来目标的绝对位置
         // ...
-        // 摩擦轮开关移到下面跟 shoot 联动, 不再无条件开启
+
+        // 自瞄模式: 摩擦轮常转, 不依赖锁敌(target_state), 避免150ms起转延时打不准;
+        // 离开自瞄模式由 RemoteControlSet 开头的默认 FRICTION_OFF 关断。
+        shoot_cmd_send.friction_mode = FRICTION_ON;
 
         if (vision_recv_data->yaw < 190 &&
             vision_recv_data->pitch < 40 &&
@@ -297,36 +293,13 @@ static void RemoteControlSet()
 
             gimbal_cmd_send.gimbal_mode = GIMBAL_GYRO_MODE;
 
-            // 拨盘: fire=1先锁存，待云台yaw/pitch均进入目标±5°后再触发。
+            // 视觉已判断到位才发 shoot 脉冲, 电控不做二次判定, 直接拨一发。
             if (vision_recv_data->shoot == 1)
             {
-                vision_shot_pending = 1;
+                shoot_cmd_send.load_mode = LOAD_1_BULLET;
                 vision_recv_data->shoot = 0; // 消费本次开火脉冲
             }
 
-            if (vision_shot_pending)
-            {
-                if (vision_recv_data->target_state != READY_TO_FIRE || !VisionIsOnline())
-                {
-                    // 锁敌丢失时取消旧开火请求，必须由视觉重新发起
-                    vision_shot_pending = 0;
-                }
-                else if (GimbalVisionTargetAligned(5.0f))
-                {
-                    shoot_cmd_send.load_mode = LOAD_1_BULLET;
-                    vision_shot_pending = 0;
-                }
-            }
-
-            // 摩擦轮: 跟锁敌标志(锁敌才开, 否则关), 与 fire 脉冲解耦, 避免每周期闪断
-            if (vision_recv_data->target_state == READY_TO_FIRE)
-            {
-                shoot_cmd_send.friction_mode = FRICTION_ON;
-            }
-            else
-            {
-                shoot_cmd_send.friction_mode = FRICTION_OFF;
-            }
         }
 
         // 导航逻辑代码

@@ -79,6 +79,9 @@ void INS_GetAttitude(float *yaw, float *pitch, float *roll);
  */
 void INS_GetGyro(float *gx, float *gy, float *gz);
 
+/* IMU 初始化完成标志: 1=完成(INS_Init 全流程跑完), 0=未完成 */
+extern volatile uint8_t INS_init_done;
+
 
 /* 用于修正安装误差的参数 */
 typedef struct
