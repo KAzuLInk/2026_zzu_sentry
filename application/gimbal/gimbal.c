@@ -25,14 +25,12 @@ static float rotate_compensator;
 // 双环PID: 角度环(外环) + 速度环(内环)
 static PIDInstance yaw_angle_pid; // 角度环: YawTotalAngle → 目标角速度
 static PIDInstance yaw_speed_pid; // 速度环: Gyro[2] → 电机速度指令
-static float yaw_angle_ref;       // 目标角度(惯性空间, 上电时锁定当前位置)
-static uint8_t yaw_angle_ref_locked; // 是否已锁定初始角度
-static uint8_t small_yaw_locked;      // 小yaw是否已锁定
+static float gun_angle_ref;          // 枪口惯性目标角 θ_gun_ref(°) — 大yaw/小yaw角度联动的唯一目标
+static uint8_t gun_angle_ref_locked; // 是否已锁定初始枪口角(上电/切换后首次锁存当前θ_gun)
 
 /* ==================== 视觉控制速度上限 (Ozone 实时可调, GimbalTask 每拍同步到 PID) ==================== */
 volatile float small_yaw_max_vel = 2000.0f; // 小yaw角度环输出上限 °/s (bjy正常值2000)
 volatile float big_yaw_max_vel   = 150.0f;  // 大yaw角度环输出上限 °/s (bjy正常值150)
-// 大yaw回中上限 recenter_max_vel 见文件下方同组声明 (bjy正常值150)
 
 // Pitch轴双环PID
 static PIDInstance pitch_angle_pid;
@@ -150,7 +148,7 @@ void GimbalInit()
     };
     PIDInit(&yaw_speed_pid, &yaw_speed_config);
 
-    yaw_angle_ref_locked = 0; // 等待Task中首次读取IMU后锁定
+    gun_angle_ref_locked = 0; // 等待Task中首次读取IMU后锁定
 
     // ====== Pitch电机 DM4310 — CAN1 ======
     Motor_Init_Config_s pitch_dm_config = {
@@ -226,13 +224,10 @@ static uint8_t  small_yaw_ctl_init = 0;     // 小yaw闭环初始化标志
 static uint8_t  last_vision_track = 0;      // 上一拍是否视觉跟踪(锁敌), 用于切入时重锁定
 static uint8_t  vision_ever_locked = 0;     // 本次视觉会话是否已锁过敌 (区分"首次进视觉"与"锁后丢失")
 
-// 小yaw主控 — 大yaw回中曲线 (Ozone可调)
-volatile float recenter_max_vel  = 150.0f;  // 边缘处大yaw回中角速度上限 °/s (bjy正常值150)
-volatile float recenter_deadband = 300.0f;  // 中心死区(ecd计数, ±300 → 1000~1600不动)
-volatile float recenter_sat      = 800.0f;  // 速度饱和偏移量(ecd, 离中心800 → 2100/500, 留余量防小yaw超调)
-volatile float recenter_exp      = 3.0f;    // 曲线指数: 2=平方, 3=三次方
-volatile float recenter_debug    = 0.0f;    // 诊断: 当前回中角速度 °/s
-static uint32_t recenter_dwt     = 0;       // 回中积分时间戳
+// 角度联动 (Ozone可调)
+volatile float vision_yaw_offset = 0.0f;   // 视觉yaw零位 vs IMU零位的固定偏置(°) — 上机标定
+volatile float follow_max_vel    = 150.0f; // FOLLOW模式枪口角速度上限 °/s (满偏摇杆)
+static uint32_t follow_dwt       = 0;      // FOLLOW角速度积分时间戳
 
 // 视觉俯仰映射
 volatile float pitch_vision_horizon = 0.020f;  // 视觉pitch=0°(水平)对应的电机位置(rad)
@@ -291,24 +286,42 @@ static void SmallYawSetEcd(uint16_t ecd_target)
     small_yaw_ecd   = ecd;
 }
 
-/* 小yaw偏离中心(1300)→大yaw回中角速度(°/s), 三次方曲线 */
-static float RecenterVel(void)
+static void BigYawAngleControl(float angle_ref); // 前置声明(GunAngleControl在其定义前调用)
+
+/* 当前枪口惯性角 θ_gun = θ_big(IMU大yaw) + θ_small(小yaw相对大yaw) */
+static float GunAngleCurrent(void)
 {
-    float recenter_vel = 0.0f;
+    float theta_big = (gimba_IMU_data != NULL) ? gimba_IMU_data->YawTotalAngle : 0.0f;
+    float theta_small = 0.0f;
     if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0)
+        theta_small = ((float)small_yaw_motor->measure.ecd - 1300.0f) * ECD_ANGLE_COEF_DJI;
+    return theta_big + theta_small;
+}
+
+/* 首次/切换后: 锁存当前枪口角, 防止目标跳变 */
+static void GunAngleRefLock(void)
+{
+    if (!gun_angle_ref_locked)
     {
-        float off = (float)small_yaw_motor->measure.ecd - 1300.0f; // 右正左负
-        float mag = off < 0.0f ? -off : off;
-        if (mag > recenter_deadband)
-        {
-            float x = (mag - recenter_deadband) / (recenter_sat - recenter_deadband);
-            if (x > 1.0f) x = 1.0f;
-            float sign = off > 0.0f ? 1.0f : -1.0f;
-            recenter_vel = sign * recenter_max_vel * powf(x, recenter_exp);
-        }
+        gun_angle_ref = GunAngleCurrent();
+        gun_angle_ref_locked = 1;
     }
-    recenter_debug = recenter_vel;
-    return recenter_vel;
+}
+
+/* 角度联动: 大yaw角度环追θ_gun_ref, 小yaw位置环追残差(θ_gun_ref - θ_big)。
+ * 小yaw是快环先吃掉误差, 大yaw是慢环慢慢追到θ_gun_ref后把小yaw顶回中位,
+ * 卸载由大yaw角度环自然完成, 无需开环回中积分。 */
+static void GunAngleControl(void)
+{
+    if (gimba_IMU_data == NULL)
+        return;
+    float theta_big = gimba_IMU_data->YawTotalAngle;
+    BigYawAngleControl(gun_angle_ref);                   // 大yaw追枪口绝对角
+    float small_deg = gun_angle_ref - theta_big;         // 小yaw残差(大yaw还没跟上的部分)
+    float ecd_target = 1300.0f + small_deg / ECD_ANGLE_COEF_DJI;
+    if (ecd_target > 2250.0f) ecd_target = 2250.0f;
+    else if (ecd_target < 405.0f) ecd_target = 405.0f;
+    SmallYawSetEcd((uint16_t)ecd_target);                // 小yaw位置闭环
 }
 
 /* 陀螺仪z轴一阶低通: 切断机械振动→速度环正反馈路径 (rad/s) */
@@ -385,59 +398,26 @@ static void GimbalHandleDisable(void)
     DMMotorSetRef(pitch_motor, 0.001f);
     // 小yaw(GM6020): 0电流失能
     if (small_yaw_motor != NULL) DJIMotorStop(small_yaw_motor);
-    yaw_angle_ref_locked = 0; // 重新使能后重锁定当前角, 防猛转回旧ref
+    gun_angle_ref_locked = 0; // 重新使能后重锁定当前枪口角, 防猛转回旧ref
 }
 
-/* 状态 VISION: 锁敌(小yaw带大yaw) / 未锁敌(小yaw大yaw保持当前位置) */
+/* 状态 VISION: 锁敌(追视觉总yaw) / 未锁敌(锁存当前枪口角保持) */
 static void GimbalHandleVision(uint8_t vision_locked)
 {
     if (vision_locked)
     {
-        // ---- 锁敌: 小yaw带动大yaw ----
-        // 小yaw主动跟踪: 视觉yaw是小yaw相对中位的目标偏角(度)，大yaw只负责从动回中
-        if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0)
-        {
-            float ecd_target = 1300.0f
-                             + vision_data->yaw / ECD_ANGLE_COEF_DJI;
-            if (ecd_target > 2250.0f) ecd_target = 2250.0f;
-            else if (ecd_target < 405.0f) ecd_target = 405.0f;
-            SmallYawSetEcd((uint16_t)ecd_target);
-        }
-        // 大yaw: 回中曲线(小yaw偏离中心越多, 大yaw回中越快) + 角度环
-        if (gimba_IMU_data != NULL)
-        {
-            if (!yaw_angle_ref_locked)
-            {
-                yaw_angle_ref = gimba_IMU_data->YawTotalAngle;
-                yaw_angle_ref_locked = 1;
-            }
-            float recenter_vel = RecenterVel();
-            float dt = DWT_GetDeltaT(&recenter_dwt);
-            if (dt > 0.02f) dt = 0.01f;
-            yaw_angle_ref += recenter_vel * dt;
-            BigYawAngleControl(yaw_angle_ref);
-        }
+        // ---- 锁敌: 视觉总yaw = 枪口绝对目标角, 折到IMU当前角±180后角度联动分解 ----
+        if (gimba_IMU_data == NULL)
+            return;
+        gun_angle_ref = WrapAngleDeg(vision_data->yaw + vision_yaw_offset,
+                                     gimba_IMU_data->YawTotalAngle);
+        GunAngleControl();
     }
     else
     {
-        // ---- 未锁敌: 小yaw/大yaw保持当前位置, 防跳变 (首次进视觉小yaw回中) ----
-        if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0)
-        {
-            if (vision_ever_locked)
-                SmallYawSetEcd(small_yaw_motor->measure.ecd); // 锁后丢失: 保持当前位置
-            else
-                SmallYawSetEcd(1300);                        // 首次进视觉: 回中
-        }
-        // 大yaw: 未锁敌保持当前角 (不再寻敌扫描)
-        if (gimba_IMU_data != NULL)
-        {
-            if (!yaw_angle_ref_locked)
-            {
-                yaw_angle_ref = gimba_IMU_data->YawTotalAngle;
-                yaw_angle_ref_locked = 1;
-            }
-            BigYawAngleControl(yaw_angle_ref);
-        }
+        // ---- 未锁敌: 锁存当前枪口角, 两轴保持(防跳变, 不再回中/寻敌) ----
+        GunAngleRefLock();
+        GunAngleControl();
     }
 }
 
@@ -464,35 +444,22 @@ static void GimbalHandleSpeed(void)
     }
 }
 
-/* 状态 FOLLOW: 小yaw摇杆映射 + 大yaw回中 */
+/* 状态 FOLLOW: 摇杆=枪口目标角速度(增量), 走角度联动分解 */
 static void GimbalHandleFollow(void)
 {
-    // 小Yaw: 位置模式 — 摇杆→ecd→total_angle, 绝对值映射不累积
-    // 摇杆线性映射: +660→405ecd, 0→中位, -660→2250ecd (ecd增大为正方向)
-    float stick = -rc_data[TEMP].rc.rocker_r_;
-    float ratio = (stick + 660.0f) / 1320.0f;
-    if (ratio > 1.0f) ratio = 1.0f;
-    if (ratio < 0.0f) ratio = 0.0f;
-    float ecd_target = 405.0f + ratio * (2250.0f - 405.0f);
-    SmallYawSetEcd((uint16_t)ecd_target);
+    if (gimba_IMU_data == NULL)
+        return;
+    GunAngleRefLock();
 
-    // 大yaw: IMU自稳(锁绝对角) + 小yaw回中(偏离中心越大角度偏移越大)
-    if (gimba_IMU_data != NULL)
-    {
-        if (!yaw_angle_ref_locked)
-        {
-            yaw_angle_ref = gimba_IMU_data->YawTotalAngle;
-            yaw_angle_ref_locked = 1;
-        }
+    // 摇杆线性映射到枪口角速度: 满偏 = follow_max_vel °/s, 中位死区防漂移
+    float stick = -rc_data[TEMP].rc.rocker_r_;              // -660 ~ +660
+    if (stick > -20.0f && stick < 20.0f) stick = 0.0f;
+    float rate_deg = stick / 660.0f * follow_max_vel;
+    float dt = DWT_GetDeltaT(&follow_dwt);
+    if (dt > 0.02f) dt = 0.01f;
+    gun_angle_ref += rate_deg * dt; // 增量积分进枪口目标角
 
-        // 回中曲线: 小yaw偏离中心越多, 回中角速度越大, 积分进角度ref
-        float recenter_vel = RecenterVel();
-        float dt = DWT_GetDeltaT(&recenter_dwt);
-        if (dt > 0.02f) dt = 0.01f; // 首次调用/机械延迟防护, 100Hz下约10ms
-        yaw_angle_ref += recenter_vel * dt; // 积分进角度ref
-
-        BigYawAngleControl(yaw_angle_ref);
-    }
+    GunAngleControl();
 }
 
 /* Pitch轴: 原生位置速度模式, 摇杆直接映射到角度 (独立于yaw状态) */
@@ -593,9 +560,9 @@ void GimbalTask()
     // ④ 非失能: 小yaw恢复使能 (失能分支用DJIMotorStop置停)
     if (small_yaw_motor != NULL) DJIMotorEnable(small_yaw_motor);
 
-    // ⑤ 刚从速控切出: 重锁定当前角, 防大yaw猛转回旧ref
+    // ⑤ 刚从速控切出: 重锁定当前枪口角, 防大yaw猛转回旧ref
     if (gimbal_ctl_prev_mode == GIMBAL_CTL_SPEED && mode != GIMBAL_CTL_SPEED)
-        yaw_angle_ref_locked = 0;
+        gun_angle_ref_locked = 0;
     gimbal_ctl_prev_mode = mode;
 
     // ⑥ 懒加载IMU/视觉数据指针
@@ -611,9 +578,9 @@ void GimbalTask()
         vision_online = VisionIsOnline();
         vision_locked = vision_online && vision_data != NULL
                         && vision_data->target_state == READY_TO_FIRE;
-        // 进入/退出跟踪子模式: 重锁大yaw目标角, 防角度跳变
+        // 进入/退出跟踪子模式: 重锁枪口目标角, 防角度跳变
         if (vision_locked != last_vision_track)
-            yaw_angle_ref_locked = 0;
+            gun_angle_ref_locked = 0;
         last_vision_track = vision_locked;
 
         // 本次视觉会话一旦锁过敌就置位, 用于区分"首次进视觉"与"锁后丢失"
@@ -637,7 +604,7 @@ void GimbalTask()
     }
 
     if (manual_override)
-        GimbalHandleFollow(); // 手动接管: 复用FOLLOW摇杆映射(小yaw摇杆 + 大yaw自动回中)
+        GimbalHandleFollow(); // 手动接管: 复用FOLLOW枪口角速度增量控制
     else
         switch (mode)
         {
@@ -654,7 +621,7 @@ void GimbalTask()
 
 /*
  * 视觉开火到位判定：
- * yaw 比较视觉给定的小yaw目标偏角与小yaw编码器实际偏角；
+ * yaw 比较视觉枪口绝对目标角与枪口实际惯性角(θ_big+θ_small)；
  * pitch 直接比较电机实际位置和视觉pitch对应的机械位置。
  */
 uint8_t GimbalVisionTargetAligned(float tolerance_deg)
@@ -669,6 +636,8 @@ uint8_t GimbalVisionTargetAligned(float tolerance_deg)
 
     if (vision_data == NULL)
         vision_data = VisionGetRecv();
+    if (gimba_IMU_data == NULL)
+        gimba_IMU_data = INS_Init();
 
     if (!VisionIsOnline() || vision_data == NULL ||
         vision_data->target_state != READY_TO_FIRE ||
@@ -678,21 +647,23 @@ uint8_t GimbalVisionTargetAligned(float tolerance_deg)
         return 0;
 
     /*
-     * 射击时视觉yaw表示小yaw相对中位的目标偏角，
-     * 大yaw是从动回中轴，不参与小yaw到位误差计算。
+     * 射击时视觉yaw是枪口绝对目标角，实际枪口角 = θ_big(IMU大yaw) + θ_small(小yaw相对大yaw)。
+     * 与GunAngleControl的联动分解保持一致。
      */
+    float theta_big = (gimba_IMU_data != NULL) ? gimba_IMU_data->YawTotalAngle : 0.0f;
     float small_yaw_deg = 0.0f;
     if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0)
     {
         small_yaw_deg = ((float)small_yaw_motor->measure.ecd - 1300.0f)
                       * ECD_ANGLE_COEF_DJI;
     }
-    float yaw_error = vision_data->yaw - small_yaw_deg;
+    float gun_deg = theta_big + small_yaw_deg;   // 枪口实际惯性角
+    float yaw_error = vision_data->yaw - gun_deg;
     if (yaw_error < 0.0f)
         yaw_error = -yaw_error;
 
     vision_align_yaw_target_deg = vision_data->yaw;
-    vision_align_yaw_actual_deg = small_yaw_deg;
+    vision_align_yaw_actual_deg = gun_deg;
     vision_align_yaw_error_deg = yaw_error;
     vision_align_yaw_ready = (yaw_error <= tolerance_deg) ? 1 : 0;
 
