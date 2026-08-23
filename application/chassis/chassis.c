@@ -131,19 +131,19 @@ void ChassisInit()
     };
     PIDInit(&chassis_yaw_hold_pid, &chassis_yaw_hold_config);
 
-    chassis_motor_config.can_init_config.tx_id = 2;
+    chassis_motor_config.can_init_config.tx_id = 3; // 左前轮实际电调 ID
     chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_REVERSE;
     motor_lf = DJIMotorInit(&chassis_motor_config);
 
-    chassis_motor_config.can_init_config.tx_id = 1;
+    chassis_motor_config.can_init_config.tx_id = 4; // 右前轮实际电调 ID
     chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_REVERSE;
     motor_rf = DJIMotorInit(&chassis_motor_config);
 
-    chassis_motor_config.can_init_config.tx_id = 3;
+    chassis_motor_config.can_init_config.tx_id = 2; // 左后轮实际电调 ID
     chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_REVERSE;
     motor_lb = DJIMotorInit(&chassis_motor_config);
 
-    chassis_motor_config.can_init_config.tx_id = 4;
+    chassis_motor_config.can_init_config.tx_id = 1; // 右后轮实际电调 ID
     chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_REVERSE;
     motor_rb = DJIMotorInit(&chassis_motor_config);
 
@@ -449,7 +449,7 @@ void ChassisTask()
 
         chassis_cmd_recv.wz = 0;
 #if defined(CHASSIS_BOARD) || defined(ONE_BOARD)
-        // UpdateChassisYawHold(); // 暂时关闭航向保持，先验证底盘开环平移是否能走直
+        UpdateChassisYawHold(); // 普通平移时用底盘IMU修正航向
 #endif
         break;
     case CHASSIS_FOLLOW_GIMBAL_YAW: // 跟随云台,不单独设置pid,以误差角度平方为速度输出

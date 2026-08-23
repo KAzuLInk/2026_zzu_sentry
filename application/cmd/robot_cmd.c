@@ -177,7 +177,7 @@ static void CalcOffsetAngle()
     // 别名angle提高可读性,不然太长了不好看,虽然基本不会动这个函数
     static float angle;
     angle = GimbalGetYawSingleRoundAngle(); // 直接读取云台大yaw反馈，避免依赖未发布的旧反馈消息
-    // GimbalGetYawSingleRoundAngle() 已返回相对底盘+Vx的有符号角度。
+    // 达妙大yaw角度已换算为相对底盘+Vx的有符号角度，供底盘旋转速度向量。
     chassis_cmd_send.offset_angle = angle;
 }
 
@@ -251,7 +251,7 @@ static void RemoteControlSet()
         chassis_cmd_send.wz = 0;
         chassis_cmd_send.chassis_mode = CHASSIS_NO_FOLLOW;
         chassis_cmd_send.vy = +26 * (float)rc_data[TEMP].rc.rocker_l_; // _水平方向
-        chassis_cmd_send.vx = +26 * (float)rc_data[TEMP].rc.rocker_l1; // 1数值方向
+        chassis_cmd_send.vx = -26 * (float)rc_data[TEMP].rc.rocker_l1; // 1数值方向
     }
 
     //我说实话，自瞄和导航和电控关系不大，你们压力视觉就行，而且注意机械结构有问题直接压力机械组
