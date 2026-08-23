@@ -254,6 +254,36 @@ void CANSetDLC(CANInstance *_instance, uint8_t length)
     _instance->txconf.DataLength = (uint32_t)(length * 65536);
 }
 
+/* ======================= FDCAN bus-off 检测与自动恢复 ======================= */
+/* 拔线/干扰会使 FDCAN 进入 bus-off,此后硬件停止收发且不自动退出,
+ * 需要软件 Stop+Start 恢复。此函数周期调用(放 DaemonTask 100Hz)实现热插拔。 */
+volatile uint8_t  can_busoff_flag[DEVICE_CAN_CNT] = {0};          // Ozone: 1=bus-off
+volatile uint32_t can_busoff_recovery_cnt[DEVICE_CAN_CNT] = {0};  // Ozone: 恢复次数
+
+void CANBusOffRecovery(void)
+{
+    static FDCAN_HandleTypeDef *can_handles[DEVICE_CAN_CNT] = {&hfdcan1, &hfdcan2, &hfdcan3};
+    static uint32_t rx_its = FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_RX_FIFO0_FULL |
+                             FDCAN_IT_RX_FIFO0_WATERMARK | FDCAN_IT_RX_FIFO0_MESSAGE_LOST |
+                             FDCAN_IT_RX_FIFO1_NEW_MESSAGE | FDCAN_IT_RX_FIFO1_FULL |
+                             FDCAN_IT_RX_FIFO1_WATERMARK | FDCAN_IT_RX_FIFO1_MESSAGE_LOST;
+
+    FDCAN_ProtocolStatusTypeDef ps;
+    for (uint8_t i = 0; i < DEVICE_CAN_CNT; i++)
+    {
+        if (HAL_FDCAN_GetProtocolStatus(can_handles[i], &ps) != HAL_OK)
+            continue;
+        can_busoff_flag[i] = (ps.BusOff != 0) ? 1 : 0;
+        if (ps.BusOff)
+        {
+            can_busoff_recovery_cnt[i]++;
+            HAL_FDCAN_Stop(can_handles[i]);                 // 进入 INIT 模式
+            HAL_FDCAN_Start(can_handles[i]);                // 退出 INIT,重新参与总线
+            HAL_FDCAN_ActivateNotification(can_handles[i], rx_its, 0); // 恢复接收中断
+        }
+    }
+}
+
 /* -----------------------belows are callback definitions--------------------------*/
 
 //对于FDCAN，回调函数和处理方式完全不同，因此直接用两套逻辑处理

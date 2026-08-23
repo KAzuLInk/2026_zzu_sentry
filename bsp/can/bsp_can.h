@@ -100,4 +100,15 @@ void CANSetDLC(CANInstance *_instance, uint8_t length);
  */
 uint8_t CANTransmit(CANInstance *_instance,float timeout);
 
+/**
+ * @brief FDCAN bus-off 检测与自动恢复,周期调用(建议放 DaemonTask)。
+ *        拔线/干扰导致 FDCAN 进入 bus-off 后,该函数检测到会 Stop+Start 恢复,
+ *        重新插线即可恢复通信(热插拔)。
+ */
+void CANBusOffRecovery(void);
+
+/* Ozone 观察: 每路 CAN 的 bus-off 状态与恢复次数 */
+extern volatile uint8_t  can_busoff_flag[DEVICE_CAN_CNT];          // 1=该路 CAN 处于 bus-off
+extern volatile uint32_t can_busoff_recovery_cnt[DEVICE_CAN_CNT];  // 累计恢复次数
+
 #endif

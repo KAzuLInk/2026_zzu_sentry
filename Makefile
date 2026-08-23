@@ -30,7 +30,7 @@ OPT = -Og
 #######################################
 # Build path
 BUILD_DIR = build
-JFLASH   ?= C:/Program Files/SEGGER/JLink_V930/JFlash.exe
+JFLASH   ?= C:/Program Files/SEGGER/JLink_V814/JFlash.exe
 
 ######################################
 # source
