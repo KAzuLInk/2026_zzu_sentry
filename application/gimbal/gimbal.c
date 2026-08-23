@@ -30,9 +30,9 @@ static uint8_t yaw_angle_ref_locked; // 是否已锁定初始角度
 static uint8_t small_yaw_locked;      // 小yaw是否已锁定
 
 /* ==================== 视觉控制速度上限 (Ozone 实时可调, GimbalTask 每拍同步到 PID) ==================== */
-volatile float small_yaw_max_vel = 80.0f;   // 小yaw角度环输出上限 °/s (原2000, 降速看现象)
-volatile float big_yaw_max_vel   = 20.0f;   // 大yaw角度环输出上限 °/s (原150, 降速看现象)
-// 大yaw回中上限 recenter_max_vel 见文件下方同组声明 (原150, 现20)
+volatile float small_yaw_max_vel = 2000.0f; // 小yaw角度环输出上限 °/s (bjy正常值2000)
+volatile float big_yaw_max_vel   = 150.0f;  // 大yaw角度环输出上限 °/s (bjy正常值150)
+// 大yaw回中上限 recenter_max_vel 见文件下方同组声明 (bjy正常值150)
 
 // Pitch轴双环PID
 static PIDInstance pitch_angle_pid;
@@ -224,9 +224,10 @@ volatile float yaw_speed_ref_deg = 150.0f;  // 速控满偏角速度 °/s, Ozone
 static uint16_t small_yaw_home_ecd = 0;     // 小yaw上电锁定位(速控模式用)
 static uint8_t  small_yaw_ctl_init = 0;     // 小yaw闭环初始化标志
 static uint8_t  last_vision_track = 0;      // 上一拍是否视觉跟踪(锁敌), 用于切入时重锁定
+static uint8_t  vision_ever_locked = 0;     // 本次视觉会话是否已锁过敌 (区分"首次进视觉"与"锁后丢失")
 
 // 小yaw主控 — 大yaw回中曲线 (Ozone可调)
-volatile float recenter_max_vel  = 20.0f;   // 边缘处大yaw回中角速度上限 °/s (临时降速看现象, 原150)
+volatile float recenter_max_vel  = 150.0f;  // 边缘处大yaw回中角速度上限 °/s (bjy正常值150)
 volatile float recenter_deadband = 300.0f;  // 中心死区(ecd计数, ±300 → 1000~1600不动)
 volatile float recenter_sat      = 800.0f;  // 速度饱和偏移量(ecd, 离中心800 → 2100/500, 留余量防小yaw超调)
 volatile float recenter_exp      = 3.0f;    // 曲线指数: 2=平方, 3=三次方
@@ -387,8 +388,8 @@ static void GimbalHandleDisable(void)
     yaw_angle_ref_locked = 0; // 重新使能后重锁定当前角, 防猛转回旧ref
 }
 
-/* 状态 VISION: 锁敌(小yaw带大yaw) / 未锁敌(大yaw寻敌) */
-static void GimbalHandleVision(uint8_t vision_online, uint8_t vision_locked)
+/* 状态 VISION: 锁敌(小yaw带大yaw) / 未锁敌(小yaw大yaw保持当前位置) */
+static void GimbalHandleVision(uint8_t vision_locked)
 {
     if (vision_locked)
     {
@@ -419,21 +420,23 @@ static void GimbalHandleVision(uint8_t vision_online, uint8_t vision_locked)
     }
     else
     {
-        // ---- 未锁敌/离线: 大yaw带动小yaw寻敌 (离线时大yaw锁当前角保持) ----
-        SmallYawSetEcd(1300); // 小yaw回中
+        // ---- 未锁敌: 小yaw/大yaw保持当前位置, 防跳变 (首次进视觉小yaw回中) ----
+        if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0)
+        {
+            if (vision_ever_locked)
+                SmallYawSetEcd(small_yaw_motor->measure.ecd); // 锁后丢失: 保持当前位置
+            else
+                SmallYawSetEcd(1300);                        // 首次进视觉: 回中
+        }
+        // 大yaw: 未锁敌保持当前角 (不再寻敌扫描)
         if (gimba_IMU_data != NULL)
         {
-            if (vision_online && vision_data != NULL)
-                BigYawAngleControl(WrapAngleDeg(vision_data->yaw, gimba_IMU_data->YawTotalAngle)); // 大yaw寻敌扫描
-            else
+            if (!yaw_angle_ref_locked)
             {
-                if (!yaw_angle_ref_locked) // 视觉离线: 锁当前角保持
-                {
-                    yaw_angle_ref = gimba_IMU_data->YawTotalAngle;
-                    yaw_angle_ref_locked = 1;
-                }
-                BigYawAngleControl(yaw_angle_ref);
+                yaw_angle_ref = gimba_IMU_data->YawTotalAngle;
+                yaw_angle_ref_locked = 1;
             }
+            BigYawAngleControl(yaw_angle_ref);
         }
     }
 }
@@ -519,8 +522,6 @@ static void GimbalHandlePitch(uint8_t vision_mode, uint8_t vision_locked)
     // 目标位置: 视觉模式用视觉pitch(度→rad), 否则摇杆映射
     if (vision_mode)
     {
-        // 右中默认保持水平，只有视觉明确报告锁敌成功才使用视觉 pitch。
-        pos_ref = pitch_vision_horizon;
         if (vision_locked)
         {
             // 锁敌: 跟随视觉 pitch
@@ -534,6 +535,11 @@ static void GimbalHandlePitch(uint8_t vision_mode, uint8_t vision_locked)
             }
             else
                 pos_ref = pitch_motor->measure.position; // 视觉数据异常: 保持
+        }
+        else
+        {
+            // 未锁敌: 首次进视觉回水平, 锁后丢失保持当前位置, 防跳变
+            pos_ref = vision_ever_locked ? pitch_motor->measure.position : pitch_vision_horizon;
         }
     }
     else
@@ -609,6 +615,14 @@ void GimbalTask()
         if (vision_locked != last_vision_track)
             yaw_angle_ref_locked = 0;
         last_vision_track = vision_locked;
+
+        // 本次视觉会话一旦锁过敌就置位, 用于区分"首次进视觉"与"锁后丢失"
+        if (vision_locked)
+            vision_ever_locked = 1;
+    }
+    else
+    {
+        vision_ever_locked = 0; // 离开视觉模式, 下次重新进视觉按"首次"处理
     }
 
     // ⑧ 状态分发
@@ -627,7 +641,7 @@ void GimbalTask()
     else
         switch (mode)
         {
-            case GIMBAL_CTL_VISION: GimbalHandleVision(vision_online, vision_locked); break;
+            case GIMBAL_CTL_VISION: GimbalHandleVision(vision_locked); break;
             case GIMBAL_CTL_SPEED:  GimbalHandleSpeed();  break;
             default:                GimbalHandleFollow(); break;
         }

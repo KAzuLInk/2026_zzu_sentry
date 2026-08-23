@@ -228,6 +228,7 @@ void ShootTask()
     // 其余(LOAD_STOP): 停止
     uint8_t loader_run = 0;
   
+    
     if (friction_on)
     {
         if (shoot_cmd_recv.load_mode == LOAD_BURSTFIRE)

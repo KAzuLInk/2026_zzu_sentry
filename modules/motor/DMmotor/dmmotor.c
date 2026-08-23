@@ -374,7 +374,7 @@ volatile uint8_t  diag_native_mode = 0; // 当前native_mode
 //@Todo: 目前只实现了力控，更多位控PID等请自行添加
 
 /* POSVEL 原生位置速度模式: 梯形速度上限 rad/s (Ozone 实时可调, 目前仅 pitch 用 POSVEL, 原4.0) */
-volatile float dm_posvel_vel_limit = 1.0f;
+volatile float dm_posvel_vel_limit = 2.5f;
 
 void DMMotorTask(void const *argument)
 {
