@@ -243,8 +243,8 @@ static void RemoteControlSet()
 
         chassis_cmd_send.wz = 0;
         chassis_cmd_send.chassis_mode = CHASSIS_NO_FOLLOW;
-        chassis_cmd_send.vx = +26 * (float)rc_data[TEMP].rc.rocker_l_; // _水平方向
-        chassis_cmd_send.vy = +26 * (float)rc_data[TEMP].rc.rocker_l1; // 1数值方向
+        chassis_cmd_send.vy = +26 * (float)rc_data[TEMP].rc.rocker_l_;  // 水平摇杆方向修正
+        chassis_cmd_send.vx = -26 * (float)rc_data[TEMP].rc.rocker_l1; // 竖直摇杆方向修正
     }
 
     //我说实话，自瞄和导航和电控关系不大，你们压力视觉就行，而且注意机械结构有问题直接压力机械组
@@ -286,7 +286,7 @@ static void RemoteControlSet()
         // 导航逻辑代码
 
         chassis_cmd_send.vy = vision_recv_data->vy * 19500; // 水平方向
-        chassis_cmd_send.vx = vision_recv_data->vx * 19500; // 竖直方向
+        chassis_cmd_send.vx = -vision_recv_data->vx * 19500; // 竖直方向，恢复昨天的正方向
 
         // 小陀螺：spin=1 用固定转速(Vz 无意义)；spin=0 用视觉 vz 当底盘 wz 并允许全向平移
         if (vision_recv_data->spin != 0)

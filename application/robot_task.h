@@ -39,9 +39,9 @@ void StartBOOTTASK(void const *argument);
  */
 void OSTaskInit()
 {
-    // 开机音效任务: 与 INS 同级, 保证 INS_Init 忙等期间能穿插播放; 播完自杀
-    osThreadDef(boottask, StartBOOTTASK, osPriorityAboveNormal, 0, 256);
-    bootTaskHandle = osThreadCreate(osThread(boottask), NULL);
+    // 开机音效暂时关闭；保留任务实现，避免影响掉线报警和其他蜂鸣器功能。
+    // osThreadDef(boottask, StartBOOTTASK, osPriorityAboveNormal, 0, 256);
+    // bootTaskHandle = osThreadCreate(osThread(boottask), NULL);
 
     osThreadDef(instask, StartINSTASK, osPriorityAboveNormal, 0, 1024);
     insTaskHandle = osThreadCreate(osThread(instask), NULL); // 由于是阻塞读取传感器,为姿态解算设置较高优先级,确保以1khz的频率执行

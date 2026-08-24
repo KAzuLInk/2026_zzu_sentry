@@ -177,9 +177,9 @@ uint8_t DaemonIsOnline(DaemonInstance *instance)
 void DaemonTask()
 {
     DaemonInstance *dins;   // 提高可读性同时降低访存开销
-    uint8_t offline_cnt = 0; // 当前离线的实例数
+    // uint8_t offline_cnt = 0; // 当前离线的实例数
 
-    DaemonAlarmEnsureInit(); // 确保报警蜂鸣器已注册
+    // DaemonAlarmEnsureInit(); // 掉线提示音暂时关闭
 
     for (size_t i = 0; i < idx; ++i)
     {
@@ -194,8 +194,9 @@ void DaemonTask()
         }
         else
         {
-            if (!dins->alarm_silent) // 静音的模块不参与掉线报警
-                offline_cnt++;       // temp_count == 0 即离线
+            // temp_count == 0 表示模块离线；提示音暂时关闭。
+            // if (!dins->alarm_silent)
+            //     offline_cnt++;
         }
 
         // 诊断: 刷新统一状态数组, Ozone看 daemon_status[] 即可
@@ -204,17 +205,17 @@ void DaemonTask()
         daemon_status[i].reload_cnt = dins->reload_cnt;
     }
 
-    // 掉线报警: 有模块离线 → 循环"滴-滴"; 全部恢复在线 → 一次性 do-re-mi 升阶
-    if (offline_cnt > 0)
-    {
-        if (daemon_alarm_mode != DAEMON_ALARM_OFFLINE)
-            DaemonAlarmSetMode(DAEMON_ALARM_OFFLINE);
-    }
-    else if (daemon_alarm_mode == DAEMON_ALARM_OFFLINE)
-    {
-        DaemonAlarmSetMode(DAEMON_ALARM_RECOVER);
-    }
-    DaemonAlarmProcess();
+    // 掉线报警暂时关闭；需要恢复时取消下面整段注释。
+    // if (offline_cnt > 0)
+    // {
+    //     if (daemon_alarm_mode != DAEMON_ALARM_OFFLINE)
+    //         DaemonAlarmSetMode(DAEMON_ALARM_OFFLINE);
+    // }
+    // else if (daemon_alarm_mode == DAEMON_ALARM_OFFLINE)
+    // {
+    //     DaemonAlarmSetMode(DAEMON_ALARM_RECOVER);
+    // }
+    // DaemonAlarmProcess();
 }
 // (需要id的原因是什么?) 下面是copilot的回答!
 // 需要id的原因是因为有些module可能有多个实例,而我们需要知道具体是哪个实例offline

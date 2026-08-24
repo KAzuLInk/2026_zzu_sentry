@@ -30,7 +30,7 @@ OPT = -Og
 #######################################
 # Build path
 BUILD_DIR = build
-JFLASH   ?= C:/Program Files/SEGGER/JLink_V814/JFlash.exe
+JFLASH   ?= C:/Program Files/SEGGER/JLink_V930/JFlash.exe
 
 ######################################
 # source
@@ -350,5 +350,5 @@ clean:
 download_dap:
 	openocd -f openocd_dap.cfg -c init -c halt -c "flash write_image erase $(BUILD_DIR)/$(TARGET).bin 0x08000000" -c reset -c shutdown
 download_jlink:
-	"C:\Program Files\SEGGER\JLink_V814\JFlash.exe" -openprj "stm32.jflash" -open'$(BUILD_DIR)/$(TARGET).hex',0x8000000 -auto -startapp -exit
+	"C:\Program Files\SEGGER\JLink_V930\JFlash.exe" -openprj "stm32.jflash" -open'$(BUILD_DIR)/$(TARGET).hex',0x8000000 -auto -startapp -exit
 # *** EOF ***

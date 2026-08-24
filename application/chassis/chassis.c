@@ -131,19 +131,19 @@ void ChassisInit()
     };
     PIDInit(&chassis_yaw_hold_pid, &chassis_yaw_hold_config);
 
-    chassis_motor_config.can_init_config.tx_id = 2; // 左前轮电调 ID
+    chassis_motor_config.can_init_config.tx_id = 3; // 左前轮电调 ID
     chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_REVERSE;
     motor_lf = DJIMotorInit(&chassis_motor_config);
 
-    chassis_motor_config.can_init_config.tx_id = 1; // 右前轮电调 ID
+    chassis_motor_config.can_init_config.tx_id = 4; // 右前轮电调 ID
     chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_REVERSE;
     motor_rf = DJIMotorInit(&chassis_motor_config);
 
-    chassis_motor_config.can_init_config.tx_id = 3; // 左后轮电调 ID
+    chassis_motor_config.can_init_config.tx_id = 2; // 左后轮电调 ID
     chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_REVERSE;
     motor_lb = DJIMotorInit(&chassis_motor_config);
 
-    chassis_motor_config.can_init_config.tx_id = 4; // 右后轮电调 ID
+    chassis_motor_config.can_init_config.tx_id = 1; // 右后轮电调 ID
     chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_REVERSE;
     motor_rb = DJIMotorInit(&chassis_motor_config);
 
