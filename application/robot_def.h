@@ -25,7 +25,7 @@
 
 /* 机器人重要参数定义,注意根据不同机器人进行修改,浮点数需要以.0或f结尾,无符号以u结尾 */
 // 云台参数
-#define YAW_CHASSIS_ALIGN_POSITION_RAD (-1.83954334f) // 达妙大yaw对准底盘+Vx时的位置(rad)
+#define YAW_CHASSIS_ALIGN_POSITION_RAD (-0.26874701f) // 达妙大yaw对准底盘+Vx时的位置(rad) [bjy值-1.8395偏90°, 加90°(π/2)修正]
 #define PITCH_HORIZON_ECD 3412      // 云台处于水平位置时编码器值,若对云台有机械改动需要修改
 #define PITCH_MAX_ANGLE 30           // 云台竖直方向最大角度 (注意反馈如果是陀螺仪，则填写陀螺仪的角度)
 #define PITCH_MIN_ANGLE -30           // 云台竖直方向最小角度 (注意反馈如果是陀螺仪，则填写陀螺仪的角度)

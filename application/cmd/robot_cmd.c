@@ -243,8 +243,8 @@ static void RemoteControlSet()
 
         chassis_cmd_send.wz = 0;
         chassis_cmd_send.chassis_mode = CHASSIS_NO_FOLLOW;
-        chassis_cmd_send.vy = +26 * (float)rc_data[TEMP].rc.rocker_l_; // _水平方向
-        chassis_cmd_send.vx = -26 * (float)rc_data[TEMP].rc.rocker_l1; // 1数值方向
+        chassis_cmd_send.vx = +26 * (float)rc_data[TEMP].rc.rocker_l_; // _水平方向
+        chassis_cmd_send.vy = +26 * (float)rc_data[TEMP].rc.rocker_l1; // 1数值方向
     }
 
     //我说实话，自瞄和导航和电控关系不大，你们压力视觉就行，而且注意机械结构有问题直接压力机械组
