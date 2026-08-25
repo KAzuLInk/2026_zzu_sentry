@@ -406,13 +406,12 @@ static void GimbalHandleVision(uint8_t vision_locked)
 {
     if (vision_locked)
     {
-        // ---- 锁敌: 视觉yaw = 小yaw相对中位的目标偏角, 枪口绝对角 = θ_big + 该偏角 ----
-        // 小yaw残差 = gun_angle_ref - θ_big = vision.yaw, 小yaw直接追视觉偏角(不猛转);
-        // 大yaw角度环追 θ_big + vision.yaw 逐拍卸载, 仍是角度联动。
+        // ---- 锁敌: 视觉yaw = 枪口绝对目标角, 折到IMU当前角±180后直接使用 ----
+        // 大yaw角度环追绝对目标角, 小yaw追残差(gun_angle_ref - θ_big), 角度联动。
         if (gimba_IMU_data == NULL)
             return;
-        gun_angle_ref = gimba_IMU_data->YawTotalAngle
-                      + (vision_data->yaw + vision_yaw_offset);
+        gun_angle_ref = WrapAngleDeg(vision_data->yaw + vision_yaw_offset,
+                                     gimba_IMU_data->YawTotalAngle);
         GunAngleControl();
     }
     else
@@ -638,6 +637,8 @@ uint8_t GimbalVisionTargetAligned(float tolerance_deg)
 
     if (vision_data == NULL)
         vision_data = VisionGetRecv();
+    if (gimba_IMU_data == NULL)
+        gimba_IMU_data = INS_Init();
 
     if (!VisionIsOnline() || vision_data == NULL ||
         vision_data->target_state != READY_TO_FIRE ||
@@ -647,21 +648,23 @@ uint8_t GimbalVisionTargetAligned(float tolerance_deg)
         return 0;
 
     /*
-     * 视觉yaw = 小yaw相对中位的目标偏角, 到位误差直接比较视觉偏角与小yaw实际偏角。
-     * 大yaw是从动卸载轴, 不参与小yaw到位误差。
+     * 视觉yaw = 枪口绝对目标角, 到位误差比较视觉绝对角与枪口实际绝对角。
+     * 枪口绝对角 = θ_big(IMU大yaw) + θ_small(小yaw相对大yaw)。
      */
+    float theta_big = (gimba_IMU_data != NULL) ? gimba_IMU_data->YawTotalAngle : 0.0f;
     float small_yaw_deg = 0.0f;
     if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0)
     {
         small_yaw_deg = ((float)small_yaw_motor->measure.ecd - 1300.0f)
                       * ECD_ANGLE_COEF_DJI;
     }
-    float yaw_error = vision_data->yaw - small_yaw_deg;
+    float gun_deg = theta_big + small_yaw_deg;   // 枪口实际绝对角
+    float yaw_error = vision_data->yaw - gun_deg;
     if (yaw_error < 0.0f)
         yaw_error = -yaw_error;
 
     vision_align_yaw_target_deg = vision_data->yaw;
-    vision_align_yaw_actual_deg = small_yaw_deg;
+    vision_align_yaw_actual_deg = gun_deg;
     vision_align_yaw_error_deg = yaw_error;
     vision_align_yaw_ready = (yaw_error <= tolerance_deg) ? 1 : 0;
 
