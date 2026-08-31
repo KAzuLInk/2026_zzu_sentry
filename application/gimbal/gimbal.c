@@ -32,6 +32,16 @@ static uint8_t gun_angle_ref_locked; // 是否已锁定初始枪口角(上电/�
 volatile float small_yaw_max_vel = 2000.0f; // 小yaw角度环输出上限 °/s (bjy正常值2000)
 volatile float big_yaw_max_vel   = 150.0f;  // 大yaw角度环输出上限 °/s (bjy正常值150)
 
+/* ==================== 小yaw世界系自稳 (Ozone实时可调) ==================== */
+/* 小yaw反馈本身是GM6020编码器(相对大yaw), 看不到世界系运动。
+ * 把 IMU 陀螺仪 Gyro[2] 反向作为速度前馈灌进小yaw速度环: 大yaw受扰转动时,
+ * 小yaw反向补偿, 使枪口在惯性系保持指向, 而不是只相对大yaw锁编码器。
+ *   gain=0: 关闭(纯大yaw系, 旧行为)
+ *   gain=1: 完全世界系自稳
+ *   gain<0: 方向反了, 取负值即可 */
+volatile float small_yaw_stab_gain = 1.0f;   // 自稳增益 (Ozone可调)
+static float small_yaw_ff_speed = 0.0f;      // 速度环前馈值 deg/s, GimbalTask每拍刷新
+
 // Pitch轴双环PID
 static PIDInstance pitch_angle_pid;
 static PIDInstance pitch_speed_pid;
@@ -97,6 +107,10 @@ void GimbalInit()
         .motor_type = GM6020,
     };
     small_yaw_motor = DJIMotorInit(&small_yaw_config);
+
+    // 世界系自稳: 开启速度前馈, 前馈值 = -gain * Gyro[2](rad/s→deg/s), 由GimbalTask每拍刷新
+    small_yaw_motor->motor_settings.feedforward_flag = SPEED_FEEDFORWARD;
+    small_yaw_motor->motor_controller.speed_feedforward_ptr = &small_yaw_ff_speed;
 
     //大yaw和pitch用的都是4310
     Motor_Init_Config_s yaw_dm_config = {
@@ -275,10 +289,10 @@ static void SmallYawSetEcd(uint16_t ecd_target)
         return;
     uint16_t ecd = small_yaw_motor->measure.ecd;
     // 限位: 顶到限位时不反向拉, 且目标不超机械范围
-    if (ecd > 2250 && ecd_target > ecd) ecd_target = ecd;
-    if (ecd < 405  && ecd_target < ecd) ecd_target = ecd;
-    if (ecd_target > 2250) ecd_target = 2250;
-    if (ecd_target < 405)  ecd_target = 405;
+    if (ecd > SMALL_YAW_ECD_MAX && ecd_target > ecd) ecd_target = ecd;
+    if (ecd < SMALL_YAW_ECD_MIN && ecd_target < ecd) ecd_target = ecd;
+    if (ecd_target > SMALL_YAW_ECD_MAX) ecd_target = SMALL_YAW_ECD_MAX;
+    if (ecd_target < SMALL_YAW_ECD_MIN) ecd_target = SMALL_YAW_ECD_MIN;
     float total_ref = small_yaw_motor->measure.total_angle
                     + ((float)ecd_target - (float)ecd) * ECD_ANGLE_COEF_DJI;
     DJIMotorSetRef(small_yaw_motor, total_ref);
@@ -294,7 +308,7 @@ static float GunAngleCurrent(void)
     float theta_big = (gimba_IMU_data != NULL) ? gimba_IMU_data->YawTotalAngle : 0.0f;
     float theta_small = 0.0f;
     if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0)
-        theta_small = ((float)small_yaw_motor->measure.ecd - 1300.0f) * ECD_ANGLE_COEF_DJI;
+        theta_small = ((float)small_yaw_motor->measure.ecd - SMALL_YAW_ECD_CENTER) * ECD_ANGLE_COEF_DJI;
     return theta_big + theta_small;
 }
 
@@ -318,9 +332,9 @@ static void GunAngleControl(void)
     float theta_big = gimba_IMU_data->YawTotalAngle;
     BigYawAngleControl(gun_angle_ref);                   // 大yaw追枪口绝对角
     float small_deg = gun_angle_ref - theta_big;         // 小yaw残差(大yaw还没跟上的部分)
-    float ecd_target = 1300.0f + small_deg / ECD_ANGLE_COEF_DJI;
-    if (ecd_target > 2250.0f) ecd_target = 2250.0f;
-    else if (ecd_target < 405.0f) ecd_target = 405.0f;
+    float ecd_target = SMALL_YAW_ECD_CENTER + small_deg / ECD_ANGLE_COEF_DJI;
+    if (ecd_target > SMALL_YAW_ECD_MAX) ecd_target = SMALL_YAW_ECD_MAX;
+    else if (ecd_target < SMALL_YAW_ECD_MIN) ecd_target = SMALL_YAW_ECD_MIN;
     SmallYawSetEcd((uint16_t)ecd_target);                // 小yaw位置闭环
 }
 
@@ -572,6 +586,13 @@ void GimbalTask()
     if (vision_data == NULL)
         vision_data = VisionGetRecv();
 
+    // ⑥½ 世界系自稳前馈: 每拍把 IMU yaw 角速度反向灌入小yaw速度环
+    if (gimba_IMU_data != NULL)
+        small_yaw_ff_speed = -small_yaw_stab_gain
+                             * gimba_IMU_data->Gyro[2] * GYRO2GIMBAL_DIR_YAW * RAD_2_DEGREE;
+    else
+        small_yaw_ff_speed = 0.0f;
+
     // ⑦ 视觉锁敌子状态
     uint8_t vision_online = 0, vision_locked = 0;
     if (mode == GIMBAL_CTL_VISION)
@@ -655,7 +676,7 @@ uint8_t GimbalVisionTargetAligned(float tolerance_deg)
     float small_yaw_deg = 0.0f;
     if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0)
     {
-        small_yaw_deg = ((float)small_yaw_motor->measure.ecd - 1300.0f)
+        small_yaw_deg = ((float)small_yaw_motor->measure.ecd - SMALL_YAW_ECD_CENTER)
                       * ECD_ANGLE_COEF_DJI;
     }
     float gun_deg = theta_big + small_yaw_deg;   // 枪口实际绝对角
@@ -731,10 +752,10 @@ float GimbalGetYawSingleRoundAngle(void)
     return angle_deg;
 }
 
-/* 小yaw(GM6020)相对中心(1300ecd)的偏转角(度)，右正左负，0x12 回传的 small_yaw 字段 */
+/* 小yaw(GM6020)相对中心的偏转角(度)，右正左负，0x12 回传的 small_yaw 字段 */
 float GimbalGetSmallYawPosition(void)
 {
     if (small_yaw_motor == NULL)
         return 0.0f;
-    return ((float)small_yaw_motor->measure.ecd - 1300.0f) * ECD_ANGLE_COEF_DJI;
+    return ((float)small_yaw_motor->measure.ecd - SMALL_YAW_ECD_CENTER) * ECD_ANGLE_COEF_DJI;
 }
