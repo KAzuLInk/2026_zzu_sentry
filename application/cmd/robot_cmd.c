@@ -249,7 +249,16 @@ static void RemoteControlSet()
 
     //我说实话，自瞄和导航和电控关系不大，你们压力视觉就行，而且注意机械结构有问题直接压力机械组
     
-    if (switch_is_mid(rc_data[TEMP].rc.switch_right)) // 右侧开关状态[中],自瞄模式(与gimbal的右中视觉模式同步)
+    // 标定模式(右中+左中): 云台锁大yaw、小yaw由遥控器控制, 这里保证底盘零力+摩擦轮关
+    if (switch_is_mid(rc_data[TEMP].rc.switch_right) && switch_is_mid(rc_data[TEMP].rc.switch_left))
+    {
+        chassis_cmd_send.chassis_mode = CHASSIS_ZERO_FORCE;
+        chassis_cmd_send.vx = 0;
+        chassis_cmd_send.vy = 0;
+        chassis_cmd_send.wz = 0;
+        shoot_cmd_send.friction_mode = FRICTION_OFF;
+    }
+    else if (switch_is_mid(rc_data[TEMP].rc.switch_right)) // 右侧开关状态[中],自瞄模式(与gimbal的右中视觉模式同步)
     {
         if (vision_recv_data == NULL)
         {

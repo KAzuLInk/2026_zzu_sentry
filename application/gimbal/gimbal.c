@@ -57,6 +57,7 @@ typedef enum {
     GIMBAL_CTL_FOLLOW,       // 手动跟随: 小yaw摇杆 + 大yaw回中
     GIMBAL_CTL_SPEED,        // 大yaw速控: 小yaw锁死 + 大yaw摇杆速控
     GIMBAL_CTL_VISION,       // 视觉自瞄: 锁敌/未锁敌两子状态
+    GIMBAL_CTL_CALIB,        // 标定: 大yaw编码器锁位 + 小yaw遥控器控制
 } gimbal_ctl_mode_e;
 
 static gimbal_ctl_mode_e gimbal_ctl_prev_mode = GIMBAL_CTL_DISABLE; // 上一拍状态, 用于切换重锁
@@ -243,6 +244,16 @@ volatile float vision_yaw_offset = 0.0f;   // 视觉yaw零位 vs IMU零位的固
 volatile float follow_max_vel    = 150.0f; // FOLLOW模式枪口角速度上限 °/s (满偏摇杆)
 static uint32_t follow_dwt       = 0;      // FOLLOW角速度积分时间戳
 
+// 标定模式: 大yaw用电机编码器位置闭环锁定(不依赖会漂移的IMU世界系) (Ozone可调)
+volatile float calib_big_yaw_hold_kp  = 25.0f; // 锁位P增益 (rad/s per rad)
+volatile float calib_big_yaw_hold_vmax = 10.0f; // 锁位最大输出速度 (rad/s)
+static float   calib_big_yaw_lock_pos = 0.0f;   // 锁存的大yaw编码器位置 (rad)
+static uint8_t calib_big_yaw_locked   = 0;      // 是否已锁存锁位目标
+volatile float calib_small_yaw_max_vel = 150.0f; // 标定态小yaw摇杆满偏角速度 (deg/s)
+static float   calib_small_yaw_ref_deg = 0.0f;
+static uint8_t calib_small_yaw_ref_locked = 0;
+static uint32_t calib_small_yaw_dwt = 0;
+
 // 视觉俯仰映射
 volatile float pitch_vision_horizon = 0.020f;  // 视觉pitch=0°(水平)对应的电机位置(rad)
 volatile float pitch_vision_min     = -0.78f;  // 俯仰下极限(rad)
@@ -374,16 +385,49 @@ static void BigYawAngleControl(float angle_ref)
     BigYawSpeedControl(target_vel * DEGREE_2_RAD);                              // °/s → rad/s
 }
 
+/* 标定模式: 大yaw编码器位置闭环锁定。
+ * 与 BigYawAngleControl 不同, 反馈用电机绝对编码器(rad, ±π)而非 IMU 世界系,
+ * IMU 漂移不会带动大yaw, 保证标定基准稳定可复现。 */
+static void BigYawHoldPosition(void)
+{
+    if (yaw_motor == NULL || yaw_motor->motor_daemon == NULL ||
+        !DaemonIsOnline(yaw_motor->motor_daemon))
+    {
+        calib_big_yaw_locked = 0;
+        if (yaw_motor != NULL)
+            DMMotorSetRef(yaw_motor, 0.0f);
+        // 没有有效反馈时不能锁存默认的 0 位置，也不能向电机施加锁位指令。
+        return;
+    }
+    if (!calib_big_yaw_locked)
+    {
+        calib_big_yaw_lock_pos = yaw_motor->measure.position; // DM绝对编码器(rad)
+        calib_big_yaw_locked = 1;
+    }
+    float err = calib_big_yaw_lock_pos - yaw_motor->measure.position;
+    while (err > PI) err -= PI2;   // 单圈wrap (position在±π)
+    while (err < -PI) err += PI2;
+    float vel = err * calib_big_yaw_hold_kp;
+    if (vel >  calib_big_yaw_hold_vmax) vel =  calib_big_yaw_hold_vmax;
+    if (vel < -calib_big_yaw_hold_vmax) vel = -calib_big_yaw_hold_vmax;
+    DMMotorSetRef(yaw_motor, vel); // MIT模式: pid_ref即速度(rad/s)
+}
+
 /* 拨杆 → 控制模式 单一真值源 */
 static gimbal_ctl_mode_e GimbalDecodeMode(void)
 {
+    if (rc_data == NULL || !RemoteControlIsOnline())
+        return GIMBAL_CTL_DISABLE;
+
     uint8_t sw_right = rc_data[TEMP].rc.switch_right;
     uint8_t sw_left  = rc_data[TEMP].rc.switch_left;
 
     // 失能: (右下 或 右中) 且 左上
     if ((switch_is_down(sw_right) || switch_is_mid(sw_right)) && switch_is_up(sw_left))
         return GIMBAL_CTL_DISABLE;
-    if (switch_is_mid(sw_right))                          // 右中 = 视觉自瞄
+    if (switch_is_mid(sw_right) && switch_is_mid(sw_left))  // 右中+左中 = 标定
+        return GIMBAL_CTL_CALIB;
+    if (switch_is_mid(sw_right))                          // 右中(左下) = 视觉自瞄
         return GIMBAL_CTL_VISION;
     if (switch_is_down(sw_right) && switch_is_mid(sw_left)) // 右下+左中 = 速控
         return GIMBAL_CTL_SPEED;
@@ -433,6 +477,40 @@ static void GimbalHandleVision(uint8_t vision_locked)
         // ---- 未锁敌: 锁存当前枪口角, 两轴保持(防跳变, 不再回中/寻敌) ----
         GunAngleRefLock();
         GunAngleControl();
+    }
+}
+
+/* 状态 CALIB: 标定 — 大yaw编码器锁死 + 小yaw遥控器手动控制 */
+static void GimbalHandleCalib(void)
+{
+    BigYawHoldPosition(); // 大yaw锁死
+
+    if (small_yaw_motor != NULL && small_yaw_motor->feed_cnt > 0)
+    {
+        if (!calib_small_yaw_ref_locked)
+        {
+            calib_small_yaw_ref_deg = ((float)small_yaw_motor->measure.ecd
+                                     - SMALL_YAW_ECD_CENTER) * ECD_ANGLE_COEF_DJI;
+            calib_small_yaw_ref_locked = 1;
+        }
+
+        float stick = -rc_data[TEMP].rc.rocker_r_;
+        if (stick > -20.0f && stick < 20.0f)
+            stick = 0.0f;
+        float dt = DWT_GetDeltaT(&calib_small_yaw_dwt);
+        if (dt > 0.02f)
+            dt = 0.01f;
+        calib_small_yaw_ref_deg += stick / 660.0f * calib_small_yaw_max_vel * dt;
+        float min_deg = (SMALL_YAW_ECD_MIN - SMALL_YAW_ECD_CENTER) * ECD_ANGLE_COEF_DJI;
+        float max_deg = (SMALL_YAW_ECD_MAX - SMALL_YAW_ECD_CENTER) * ECD_ANGLE_COEF_DJI;
+        if (calib_small_yaw_ref_deg < min_deg) calib_small_yaw_ref_deg = min_deg;
+        if (calib_small_yaw_ref_deg > max_deg) calib_small_yaw_ref_deg = max_deg;
+
+        float ecd = SMALL_YAW_ECD_CENTER
+                  + calib_small_yaw_ref_deg / ECD_ANGLE_COEF_DJI;
+        if (ecd > SMALL_YAW_ECD_MAX) ecd = SMALL_YAW_ECD_MAX;
+        if (ecd < SMALL_YAW_ECD_MIN) ecd = SMALL_YAW_ECD_MIN;
+        SmallYawSetEcd((uint16_t)ecd);
     }
 }
 
@@ -566,6 +644,13 @@ void GimbalTask()
     // ③ 失能态: 停所有电机后立即返回
     if (mode == GIMBAL_CTL_DISABLE)
     {
+        // 失能分支会提前返回，必须在这里清除标定锁位，避免下次进入沿用旧目标。
+        if (gimbal_ctl_prev_mode == GIMBAL_CTL_CALIB)
+        {
+            calib_big_yaw_locked = 0;
+            calib_small_yaw_ref_locked = 0;
+            gun_angle_ref_locked = 0;
+        }
         gimbal_ctl_prev_mode = mode;
         GimbalHandleDisable();
         rc_online = RemoteControlIsOnline();
@@ -578,6 +663,13 @@ void GimbalTask()
     // ⑤ 刚从速控切出: 重锁定当前枪口角, 防大yaw猛转回旧ref
     if (gimbal_ctl_prev_mode == GIMBAL_CTL_SPEED && mode != GIMBAL_CTL_SPEED)
         gun_angle_ref_locked = 0;
+    // 刚从标定切出: 清锁位标志(下次重进重新锁当前位) + 重锁定枪口角
+    if (gimbal_ctl_prev_mode == GIMBAL_CTL_CALIB && mode != GIMBAL_CTL_CALIB)
+    {
+        calib_big_yaw_locked = 0;
+        calib_small_yaw_ref_locked = 0;
+        gun_angle_ref_locked = 0;
+    }
     gimbal_ctl_prev_mode = mode;
 
     // ⑥ 懒加载IMU/视觉数据指针
@@ -587,7 +679,9 @@ void GimbalTask()
         vision_data = VisionGetRecv();
 
     // ⑥½ 世界系自稳前馈: 每拍把 IMU yaw 角速度反向灌入小yaw速度环
-    if (gimba_IMU_data != NULL)
+    if (mode == GIMBAL_CTL_CALIB)
+        small_yaw_ff_speed = 0.0f; // 标定态切断世界系自稳, 避免IMU漂移污染小yaw
+    else if (gimba_IMU_data != NULL)
         small_yaw_ff_speed = -small_yaw_stab_gain
                              * gimba_IMU_data->Gyro[2] * GYRO2GIMBAL_DIR_YAW * RAD_2_DEGREE;
     else
@@ -595,7 +689,7 @@ void GimbalTask()
 
     // ⑦ 视觉锁敌子状态
     uint8_t vision_online = 0, vision_locked = 0;
-    if (mode == GIMBAL_CTL_VISION)
+    if (mode == GIMBAL_CTL_VISION || mode == GIMBAL_CTL_CALIB)
     {
         vision_online = VisionIsOnline();
         vision_locked = vision_online && vision_data != NULL
@@ -631,13 +725,14 @@ void GimbalTask()
         switch (mode)
         {
             case GIMBAL_CTL_VISION: GimbalHandleVision(vision_locked); break;
+            case GIMBAL_CTL_CALIB:  GimbalHandleCalib();  break;
             case GIMBAL_CTL_SPEED:  GimbalHandleSpeed();  break;
             default:                GimbalHandleFollow(); break;
         }
 
     rc_online = RemoteControlIsOnline(); // 看Ozone: 1=在线 0=离线
 
-    // ⑨ Pitch轴独立控制: 手动接管时走摇杆映射, 否则视觉
+    // ⑨ Pitch轴独立控制: 自瞄态走视觉, 标定态和其他手动态走遥控器摇杆
     GimbalHandlePitch(manual_override ? 0 : (mode == GIMBAL_CTL_VISION), vision_locked);
 }
 
